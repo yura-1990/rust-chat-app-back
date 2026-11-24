@@ -1,0 +1,220 @@
+syntax = "proto3";
+
+package chat.v1;
+
+// Single envelope for every message exchanged over the realtime WebSocket.
+// Adding a new Op + oneof variant never breaks old clients (Discord-gateway
+// style). Op numbers and field numbers are never reused once shipped.
+message Envelope {
+  Op op = 1;
+  uint64 seq = 2;
+
+  oneof payload {
+    Hello hello = 3;
+    HelloAck hello_ack = 4;
+    Heartbeat heartbeat = 5;
+    HeartbeatAck heartbeat_ack = 6;
+    SendMessage send_message = 7;
+    MessageCreated message_created = 8;
+    Error error = 9;
+    Typing typing = 10;
+    CallInvite call_invite = 11;
+    CallAnswer call_answer = 12;
+    CallSignal call_signal = 13;
+    CallEnd call_end = 14;
+    EditMessage edit_message = 15;
+    MessageEdited message_edited = 16;
+    DeleteMessage delete_message = 17;
+    MessageDeleted message_deleted = 18;
+  }
+}
+
+enum Op {
+  OP_UNSPECIFIED = 0;
+  OP_HELLO = 1;
+  OP_HELLO_ACK = 2;
+  OP_HEARTBEAT = 3;
+  OP_HEARTBEAT_ACK = 4;
+  OP_SEND_MESSAGE = 5;
+  OP_MESSAGE_CREATED = 6;
+  OP_ERROR = 7;
+  OP_TYPING = 8;
+  OP_CALL_INVITE = 9;
+  OP_CALL_ANSWER = 10;
+  OP_CALL_SIGNAL = 11;
+  OP_CALL_END = 12;
+  OP_EDIT_MESSAGE = 13;
+  OP_MESSAGE_EDITED = 14;
+  OP_DELETE_MESSAGE = 15;
+  OP_MESSAGE_DELETED = 16;
+}
+
+// Client -> server, first frame after the socket opens.
+message Hello {
+  string token = 1;
+  string device_id = 2;
+}
+
+// Server -> client, reply to Hello.
+message HelloAck {
+  string session_id = 1;
+  int64 server_time_ms = 2;
+}
+
+message Heartbeat {
+  int64 client_time_ms = 1;
+}
+
+message HeartbeatAck {
+  int64 server_time_ms = 1;
+}
+
+// Client -> server.
+message SendMessage {
+  uint64 chat_id = 1;
+  string client_nonce = 2; // lets the client match the ack to its optimistic UI entry
+  string text = 3;
+  Media media = 4; // present for a media message (optionally with a caption in `text`)
+  uint64 reply_to_id = 5; // 0 = not a reply; must be a message in this same chat
+  ForwardedFrom forwarded_from = 6; // present when forwarding someone else's message
+}
+
+// Server -> client (broadcast to all participants, including the sender).
+message MessageCreated {
+  uint64 id = 1;
+  uint64 chat_id = 2;
+  uint64 author_id = 3;
+  string text = 4;
+  int64 created_at_ms = 5;
+  string client_nonce = 6;
+  Media media = 7;
+  uint64 reply_to_id = 8; // 0 = not a reply
+  ReplyPreview reply_preview = 9; // server-resolved snapshot of the replied-to message
+  ForwardedFrom forwarded_from = 10;
+}
+
+// A lightweight, server-computed snapshot of the message being replied
+// to — resolved by a single primary-key lookup at send/fetch time, so
+// clients never need the original message already loaded to render the
+// quote. Always present when reply_to_id is non-zero.
+message ReplyPreview {
+  uint64 message_id = 1;
+  uint64 author_id = 2;
+  string text = 3; // truncated
+  string media_kind = 4; // "" if the replied-to message had no attachment
+  bool deleted = 5; // the replied-to message has since been deleted
+}
+
+// Client -> server: edit the text of a message you authored. Media/reply/
+// forward references on the message are untouched — only `text` changes.
+message EditMessage {
+  uint64 chat_id = 1;
+  uint64 message_id = 2;
+  string text = 3;
+}
+
+// Server -> client, broadcast to every member once an edit is applied.
+message MessageEdited {
+  uint64 id = 1;
+  uint64 chat_id = 2;
+  string text = 3;
+  int64 edited_at_ms = 4;
+}
+
+// Client -> server: delete a message you authored, for everyone in the
+// chat (there's no "delete for me only").
+message DeleteMessage {
+  uint64 chat_id = 1;
+  uint64 message_id = 2;
+}
+
+// Server -> client, broadcast to every member once a message is deleted.
+// The row isn't removed — text/media are cleared server-side and every
+// client renders a tombstone ("message deleted") in its place.
+message MessageDeleted {
+  uint64 id = 1;
+  uint64 chat_id = 2;
+  int64 deleted_at_ms = 3;
+}
+
+// Identifies the original sender of a forwarded message. The containing
+// message's own author_id is always the forwarder, never the original
+// sender — this is what lets a bubble show "Forwarded from <username>"
+// without claiming the forwarder wrote it.
+message ForwardedFrom {
+  uint64 user_id = 1;
+  string username = 2;
+}
+
+// An attached photo, file, voice note, or round (Telegram-style) video
+// message. The
+// client uploads the bytes separately via POST /chats/:id/media first (see
+// docs/API.md), gets back `media_id`, and sends this referencing it. `url`
+// is always server-filled — a short-lived signed URL minted fresh whenever
+// the message is broadcast or re-fetched, never stored or trusted from the
+// client.
+message Media {
+  uint64 media_id = 1;
+  string kind = 2; // "image" | "file" | "round_video" | "voice"
+  string mime = 3;
+  string name = 4; // original filename, shown for "file" kind
+  uint64 size = 5;
+  uint64 duration_ms = 6; // "round_video" only
+  string url = 7;
+}
+
+message Error {
+  uint32 code = 1;
+  string message = 2;
+}
+
+// Client -> server: "I'm typing in this chat." Never persisted — purely
+// ephemeral, fanned out through the same NATS subject as messages.
+// Server -> client: the relayed version, with user_id filled in from the
+// sender's session (the client never sets it).
+message Typing {
+  uint64 chat_id = 1;
+  uint64 user_id = 2;
+}
+
+// Realtime 1:1 calling, signaled entirely over this WebSocket — the server
+// never looks inside these messages, it only checks chat membership and
+// relays. All four carry chat_id (so the server stays stateless about
+// calls) and user_id (server-stamped from the sender's session, same as
+// Typing). call_id is a client-generated UUID identifying one call attempt.
+
+// Client -> server: ring the other participant(s) of this chat.
+message CallInvite {
+  uint64 chat_id = 1;
+  string call_id = 2;
+  bool video = 3;
+  uint64 user_id = 4;
+}
+
+// Client -> server: accept or decline an invite. accepted=false doubles as
+// "declined" when sent before negotiation, or "hung up" after.
+message CallAnswer {
+  uint64 chat_id = 1;
+  string call_id = 2;
+  bool accepted = 3;
+  uint64 user_id = 4;
+}
+
+// WebRTC SDP offer/answer or ICE candidate exchange, relayed verbatim
+// between the two participants once a call is accepted. `kind` is
+// "offer" | "answer" | "ice"; `data` is that payload JSON-encoded (an SDP
+// string, or an RTCIceCandidateInit).
+message CallSignal {
+  uint64 chat_id = 1;
+  string call_id = 2;
+  string kind = 3;
+  string data = 4;
+  uint64 user_id = 5;
+}
+
+// Either side can end the call at any point.
+message CallEnd {
+  uint64 chat_id = 1;
+  string call_id = 2;
+  uint64 user_id = 3;
+}

@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/common", "crates/proto", "crates/auth", "crates/chat", "crates/gateway"]
+
+[workspace.package]
+edition = "2024"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time", "fs"] }
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+prost = "0.13"
+bytes = "1"
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"

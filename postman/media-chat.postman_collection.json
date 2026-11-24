@@ -1,0 +1,776 @@
+{
+  "info": {
+    "name": "media — realtime chat API",
+    "description": "HTTP surface of the Rust gateway. The realtime chat protocol itself runs over a binary-protobuf WebSocket (ws://{{base_url_ws}}/ws) which Postman can't decode — see docs/API.md for that. Run requests top-to-bottom: Register/Login capture {{token}} and {{user_id}} automatically, and Create direct chat captures {{chat_id}}.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://127.0.0.1:8080"
+    },
+    {
+      "key": "token",
+      "value": ""
+    },
+    {
+      "key": "user_id",
+      "value": ""
+    },
+    {
+      "key": "other_user_id",
+      "value": ""
+    },
+    {
+      "key": "chat_id",
+      "value": ""
+    },
+    {
+      "key": "media_id",
+      "value": ""
+    },
+    {
+      "key": "dest_chat_id",
+      "value": "",
+      "description": "a second chat_id to forward into; set manually after creating another chat"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "GET /health",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/health"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "POST /auth/register",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 201) {",
+                  "  const body = pm.response.json();",
+                  "  pm.collectionVariables.set('token', body.token);",
+                  "  pm.collectionVariables.set('user_id', String(body.user_id));",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/auth/register",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"alice\",\n  \"password\": \"correcthorse\"\n}"
+            }
+          },
+          "response": [
+            {
+              "name": "201 Created",
+              "code": 201,
+              "body": "{\n  \"user_id\": \"383339900428095488\",\n  \"token\": \"<jwt>\"\n}"
+            },
+            {
+              "name": "409 Conflict (username taken)",
+              "code": 409,
+              "body": "username already taken"
+            },
+            {
+              "name": "400 Bad Request (weak password)",
+              "code": 400,
+              "body": "password must be at least 8 characters"
+            }
+          ]
+        },
+        {
+          "name": "POST /auth/login",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  const body = pm.response.json();",
+                  "  pm.collectionVariables.set('token', body.token);",
+                  "  pm.collectionVariables.set('user_id', String(body.user_id));",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/auth/login",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"alice\",\n  \"password\": \"correcthorse\"\n}"
+            }
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "code": 200,
+              "body": "{\n  \"user_id\": \"383339900428095488\",\n  \"token\": \"<jwt>\"\n}"
+            },
+            {
+              "name": "401 Unauthorized",
+              "code": 401,
+              "body": "invalid username or password"
+            }
+          ]
+        },
+        {
+          "name": "GET /me",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/me",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}"
+                }
+              ]
+            }
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "code": 200,
+              "body": "{\n  \"user_id\": \"383339900428095488\",\n  \"username\": \"alice\"\n}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Users",
+      "item": [
+        {
+          "name": "GET /users/lookup",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/users/lookup?username=bob",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "users",
+                "lookup"
+              ],
+              "query": [
+                {
+                  "key": "username",
+                  "value": "bob"
+                }
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}"
+                }
+              ]
+            }
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "code": 200,
+              "body": "{\n  \"user_id\": \"383339902315532288\",\n  \"username\": \"bob\"\n}"
+            },
+            {
+              "name": "404 Not Found",
+              "code": 404,
+              "body": ""
+            }
+          ]
+        },
+        {
+          "name": "POST /users/:user_id/block",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}/users/{{other_user_id}}/block",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "users",
+                "{{other_user_id}}",
+                "block"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}"
+                }
+              ]
+            }
+          },
+          "response": [
+            {
+              "name": "204 No Content",
+              "code": 204,
+              "body": ""
+            }
+          ]
+        },
+        {
+          "name": "POST /users/:user_id/unblock",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}/users/{{other_user_id}}/unblock",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "users",
+                "{{other_user_id}}",
+                "unblock"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}"
+                }
+              ]
+            }
+          },
+          "response": [
+            {
+              "name": "204 No Content",
+              "code": 204,
+              "body": ""
+            }
+          ]
+        },
+        {
+          "name": "GET /blocks",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/blocks",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "blocks"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}"
+                }
+              ]
+            }
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "code": 200,
+              "body": "[\n  { \"user_id\": \"383339902315532288\", \"username\": \"carol\" }\n]"
+            }
+          ]
+        },
+        {
+          "name": "POST /users/:user_id/report-spam",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/users/{{other_user_id}}/report-spam",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "users",
+                "{{other_user_id}}",
+                "report-spam"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chat_id\": \"{{chat_id}}\"\n}"
+            },
+            "description": "chat_id is optional. Always blocks the reported user too; also leaves chat_id for the caller if given."
+          },
+          "response": [
+            {
+              "name": "204 No Content",
+              "code": 204,
+              "body": ""
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Chats",
+      "item": [
+        {
+          "name": "GET /chats",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/chats",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}"
+                }
+              ]
+            }
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "code": 200,
+              "body": "[\n  {\n    \"chat_id\": \"383339928404107264\",\n    \"other_user_id\": \"383339902315532288\",\n    \"other_username\": \"bob\",\n    \"last_message\": {\n      \"text\": \"hi bob, from alice\",\n      \"created_at_ms\": 1795462580793\n    }\n  }\n]"
+            }
+          ]
+        },
+        {
+          "name": "POST /chats/direct",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  pm.collectionVariables.set('chat_id', String(pm.response.json().chat_id));",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/chats/direct",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"with_user_id\": \"{{other_user_id}}\"\n}"
+            }
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "code": 200,
+              "body": "{\n  \"chat_id\": \"383339928404107264\"\n}"
+            },
+            {
+              "name": "401 Unauthorized (missing/invalid token)",
+              "code": 401,
+              "body": ""
+            }
+          ]
+        },
+        {
+          "name": "POST /chats/saved",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}/chats/saved",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "chats",
+                "saved"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}"
+                }
+              ]
+            },
+            "description": "Idempotent -- returns (creating the first time) the caller's own Saved Messages chat_id. No second member; shows up in GET /chats with is_self: true."
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "code": 200,
+              "body": "{\n  \"chat_id\": \"383339928404107264\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "GET /chats/:chat_id/messages",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/chats/{{chat_id}}/messages?limit=50",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "chats",
+                "{{chat_id}}",
+                "messages"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "50"
+                }
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}"
+                }
+              ]
+            }
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "code": 200,
+              "body": "[\n  {\n    \"id\": \"383340011241611264\",\n    \"chat_id\": \"383339928404107264\",\n    \"author_id\": \"383339900428095488\",\n    \"text\": \"hi bob, from alice\",\n    \"created_at_ms\": 1795462580793\n  }\n]"
+            },
+            {
+              "name": "403 Forbidden (not a member)",
+              "code": 403,
+              "body": ""
+            }
+          ]
+        },
+        {
+          "name": "POST /chats/:chat_id/clear",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}/chats/{{chat_id}}/clear",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "chats",
+                "{{chat_id}}",
+                "clear"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}"
+                }
+              ]
+            },
+            "description": "Clears the caller's own view of this chat's history. Other member's copy untouched."
+          },
+          "response": [
+            {
+              "name": "204 No Content",
+              "code": 204,
+              "body": ""
+            },
+            {
+              "name": "403 Forbidden (not a member)",
+              "code": 403,
+              "body": ""
+            }
+          ]
+        },
+        {
+          "name": "DELETE /chats/:chat_id",
+          "request": {
+            "method": "DELETE",
+            "url": {
+              "raw": "{{base_url}}/chats/{{chat_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "chats",
+                "{{chat_id}}"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}"
+                }
+              ]
+            },
+            "description": "\"Deletes\" the chat for the caller only -- drops out of their own chat list and WS fan-out. Other member's copy and all messages untouched."
+          },
+          "response": [
+            {
+              "name": "204 No Content",
+              "code": 204,
+              "body": ""
+            },
+            {
+              "name": "403 Forbidden (not a member)",
+              "code": 403,
+              "body": ""
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Media",
+      "item": [
+        {
+          "name": "POST /chats/:chat_id/media (upload)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  pm.collectionVariables.set('media_id', String(pm.response.json().media_id));",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "image/png",
+                "description": "Set to the real mime type of the file you attach below."
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/chats/{{chat_id}}/media?kind=image&name=photo.png",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "chats",
+                "{{chat_id}}",
+                "media"
+              ],
+              "query": [
+                {
+                  "key": "kind",
+                  "value": "image",
+                  "description": "image | file | round_video"
+                },
+                {
+                  "key": "name",
+                  "value": "photo.png",
+                  "description": "only checked for kind=file (dangerous-extension blocklist)"
+                }
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}"
+                }
+              ]
+            },
+            "body": {
+              "mode": "file",
+              "file": {}
+            },
+            "description": "Body is the raw file bytes (not multipart) — in Postman, set Body > binary and choose a file. The two-step attachment flow is: upload here to get media_id, then reference it in a SendMessage over the WebSocket (see docs/API.md) to actually create the message."
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "code": 200,
+              "body": "{\n  \"media_id\": \"383387716202541056\",\n  \"kind\": \"image\",\n  \"mime\": \"image/png\",\n  \"name\": null,\n  \"size\": 68\n}"
+            },
+            {
+              "name": "403 Forbidden (not a chat member)",
+              "code": 403,
+              "body": ""
+            },
+            {
+              "name": "413 Payload Too Large (over 25 MB)",
+              "code": 413,
+              "body": ""
+            }
+          ]
+        },
+        {
+          "name": "POST /chats/:dest_chat_id/media/forward",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/chats/{{dest_chat_id}}/media/forward",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "chats",
+                "{{dest_chat_id}}",
+                "media",
+                "forward"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token}}"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"source_chat_id\": \"{{chat_id}}\",\n  \"media_id\": \"{{media_id}}\"\n}"
+            },
+            "description": "Copies the media from {{chat_id}} (source) into {{dest_chat_id}} (destination) server-side, minting a new media_id there. Caller must be a member of both chats, and the source media_id must already be attached to a real message (run the upload request above, then actually send it as a message over WS, before trying this)."
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "code": 200,
+              "body": "{\n  \"media_id\": \"383394690587701248\",\n  \"kind\": \"image\",\n  \"mime\": \"image/png\",\n  \"name\": null,\n  \"size\": 68\n}"
+            },
+            {
+              "name": "403 Forbidden (not a member of source or dest chat)",
+              "code": 403,
+              "body": ""
+            },
+            {
+              "name": "404 Not Found (media_id not attached to a message in source chat)",
+              "code": 404,
+              "body": ""
+            }
+          ]
+        },
+        {
+          "name": "GET /media/:chat_id/:media_id (serve)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/media/{{chat_id}}/{{media_id}}?exp=0&sig=",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "media",
+                "{{chat_id}}",
+                "{{media_id}}"
+              ],
+              "query": [
+                {
+                  "key": "exp",
+                  "value": "0"
+                },
+                {
+                  "key": "sig",
+                  "value": ""
+                }
+              ]
+            },
+            "description": "Not directly runnable from this placeholder — exp/sig are an HMAC-signed pair the server mints itself and only hands back inside a MessageCreated (WebSocket) or GET /chats/:chat_id/messages response's media.url field. Copy a real media.url from one of those instead of filling in exp/sig by hand."
+          },
+          "response": [
+            {
+              "name": "200 OK (the file bytes)",
+              "code": 200,
+              "body": ""
+            },
+            {
+              "name": "403 Forbidden (bad/expired signature)",
+              "code": 403,
+              "body": ""
+            },
+            {
+              "name": "404 Not Found (no message references this media_id)",
+              "code": 404,
+              "body": ""
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

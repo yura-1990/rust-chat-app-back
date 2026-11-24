@@ -1,0 +1,9 @@
+[package]
+name = "chat-service"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+chat-common = { path = "../common" }
+sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio-rustls", "macros"] }
+thiserror = "2.0.21"
