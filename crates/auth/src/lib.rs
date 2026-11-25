@@ -79,6 +79,24 @@ impl AuthService {
             .await?;
         Ok(row.map(|(user_id, username)| UserSummary { user_id, username }))
     }
+
+    pub async fn search_users(&self, query: &str, exclude_user_id: i64, limit: i64) -> Result<Vec<UserSummary>, AuthError> {
+        // Escape ILIKE wildcards so a literal `%`/`_` in the query doesn't act as one.
+        let escaped = query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let pattern = format!("{escaped}%");
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "select id, username from users where username ilike $1 and id != $2 order by username limit $3",
+        )
+        .bind(pattern)
+        .bind(exclude_user_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(user_id, username)| UserSummary { user_id, username })
+            .collect())
+    }
 }
 
 fn is_unique_violation(err: &sqlx::Error) -> bool {

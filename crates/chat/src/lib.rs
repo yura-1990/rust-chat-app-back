@@ -69,6 +69,7 @@ pub struct DirectChatSummary {
     /// user has open). `other_user_id`/`other_username` are the caller's
     /// own identity in this case — there's no one else in the chat.
     pub is_self: bool,
+    pub is_archived: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -206,6 +207,7 @@ impl ChatService {
             Option<String>,
             Option<i64>,
             bool,
+            bool,
         );
         // Unioned rather than one query with an outer-joined "other" member,
         // because a direct chat's "other" is a different row (other.user_id
@@ -217,7 +219,7 @@ impl ChatService {
         // ordered from the outside instead, where it's just a plain SELECT.
         let rows: Vec<Row> = sqlx::query_as(
             "select * from (
-                select c.id, u.id, u.username, lm.body, lm.created_at_ms, lm.media_kind, lm.deleted_at_ms, false as is_self
+                select c.id, u.id, u.username, lm.body, lm.created_at_ms, lm.media_kind, lm.deleted_at_ms, false as is_self, me.archived_at_ms is not null as is_archived
                 from chats c
                 join chat_members me on me.chat_id = c.id and me.user_id = $1 and me.left_at_ms is null
                 join chat_members other on other.chat_id = c.id and other.user_id <> $1
@@ -231,7 +233,7 @@ impl ChatService {
 
                 union all
 
-                select c.id, u.id, u.username, lm.body, lm.created_at_ms, lm.media_kind, lm.deleted_at_ms, true as is_self
+                select c.id, u.id, u.username, lm.body, lm.created_at_ms, lm.media_kind, lm.deleted_at_ms, true as is_self, me.archived_at_ms is not null as is_archived
                 from chats c
                 join chat_members me on me.chat_id = c.id and me.user_id = $1 and me.left_at_ms is null
                 join users u on u.id = me.user_id
@@ -241,7 +243,7 @@ impl ChatService {
                     order by m.id desc limit 1
                 ) lm on true
                 where c.kind = 'self'
-             ) combined (chat_id, other_user_id, other_username, body, created_at_ms, media_kind, deleted_at_ms, is_self)
+             ) combined (chat_id, other_user_id, other_username, body, created_at_ms, media_kind, deleted_at_ms, is_self, is_archived)
              order by coalesce(created_at_ms, 0) desc",
         )
         .bind(user_id)
@@ -251,7 +253,7 @@ impl ChatService {
         Ok(rows
             .into_iter()
             .map(
-                |(chat_id, other_user_id, other_username, text, created_at_ms, media_kind, deleted_at_ms, is_self)| DirectChatSummary {
+                |(chat_id, other_user_id, other_username, text, created_at_ms, media_kind, deleted_at_ms, is_self, is_archived)| DirectChatSummary {
                     chat_id,
                     other_user_id,
                     other_username,
@@ -262,6 +264,7 @@ impl ChatService {
                         deleted: deleted_at_ms.is_some(),
                     }),
                     is_self,
+                    is_archived,
                 },
             )
             .collect())
@@ -452,6 +455,29 @@ impl ChatService {
         .bind(user_id)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// Hides this chat from the caller's own main chat list (see
+    /// `list_direct_chats_for_user`'s `is_archived`) without touching
+    /// membership, messages, or the other member's view. Sending/receiving
+    /// still works as normal — archiving is purely a list-visibility flag.
+    pub async fn archive_chat(&self, chat_id: i64, user_id: i64) -> Result<(), ChatError> {
+        sqlx::query("update chat_members set archived_at_ms = $3 where chat_id = $1 and user_id = $2")
+            .bind(chat_id)
+            .bind(user_id)
+            .bind(now_ms())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn unarchive_chat(&self, chat_id: i64, user_id: i64) -> Result<(), ChatError> {
+        sqlx::query("update chat_members set archived_at_ms = null where chat_id = $1 and user_id = $2")
+            .bind(chat_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

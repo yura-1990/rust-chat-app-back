@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -7,7 +8,7 @@ use axum::response::IntoResponse;
 use futures_util::stream::SplitStream;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as _;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
 use chat_proto::chat::v1::envelope::Payload;
 use chat_proto::chat::v1::{
@@ -171,8 +172,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         }
     }
 
-    for subscription in subscriptions {
-        subscription.abort();
+    for handle in subscriptions.handles.lock().await.drain(..) {
+        handle.abort();
     }
     writer.abort();
 }
@@ -192,37 +193,83 @@ async fn authenticate(stream: &mut SplitStream<WebSocket>, state: &AppState) -> 
     state.auth.verify_token(&hello.token).ok().map(|claims| claims.user_id)
 }
 
-async fn subscribe_to_memberships(
-    state: &Arc<AppState>,
-    user_id: i64,
-    tx: mpsc::Sender<Vec<u8>>,
-) -> Vec<tokio::task::JoinHandle<()>> {
+/// All NATS subscriptions a connection is holding — both the per-chat ones
+/// taken at `Hello` and any added afterward. Shared with the control-subject
+/// listener so it can add a new chat subscription without the connection
+/// reconnecting, and with the disconnect path so everything gets aborted.
+struct Subscriptions {
+    handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    chat_ids: Mutex<HashSet<i64>>,
+}
+
+async fn subscribe_to_memberships(state: &Arc<AppState>, user_id: i64, tx: mpsc::Sender<Vec<u8>>) -> Arc<Subscriptions> {
+    let subs = Arc::new(Subscriptions {
+        handles: Mutex::new(Vec::new()),
+        chat_ids: Mutex::new(HashSet::new()),
+    });
+
     let chat_ids = match state.chat.chats_for_user(user_id).await {
         Ok(ids) => ids,
         Err(err) => {
             tracing::warn!(?err, user_id, "failed to load chat memberships");
-            return Vec::new();
+            Vec::new()
         }
     };
-
-    let mut handles = Vec::with_capacity(chat_ids.len());
     for chat_id in chat_ids {
-        let subject = format!("chat.{chat_id}");
-        match state.nats.subscribe(subject.clone()).await {
-            Ok(mut subscriber) => {
-                let tx = tx.clone();
-                handles.push(tokio::spawn(async move {
-                    while let Some(message) = subscriber.next().await {
-                        if tx.send(message.payload.to_vec()).await.is_err() {
-                            break;
-                        }
-                    }
-                }));
-            }
-            Err(err) => tracing::warn!(?err, %subject, "failed to subscribe to chat"),
+        subscribe_to_chat(state, chat_id, tx.clone(), &subs).await;
+    }
+
+    // Memberships are only snapshotted above — a chat created *after* this
+    // connection opened (e.g. the other side was already online when you
+    // started a new chat with them) would otherwise never reach them until
+    // they reconnect. `create_direct_chat` publishes here to close that gap.
+    let control_subject = format!("user.{user_id}.new_chat");
+    match state.nats.subscribe(control_subject.clone()).await {
+        Ok(mut subscriber) => {
+            let state = state.clone();
+            let tx = tx.clone();
+            let subs_for_control = subs.clone();
+            let handle = tokio::spawn(async move {
+                while let Some(message) = subscriber.next().await {
+                    let Ok(text) = std::str::from_utf8(&message.payload) else { continue };
+                    let Ok(chat_id) = text.parse::<i64>() else { continue };
+                    subscribe_to_chat(&state, chat_id, tx.clone(), &subs_for_control).await;
+                }
+            });
+            subs.handles.lock().await.push(handle);
+        }
+        Err(err) => tracing::warn!(?err, %control_subject, "failed to subscribe to new-chat notifications"),
+    }
+
+    subs
+}
+
+/// Subscribes to a single chat's NATS subject and forwards every message
+/// straight into this connection's outgoing channel. No-op if already
+/// subscribed, so it's safe to call both at `Hello` and again from the
+/// `new_chat` control listener for the same chat.
+async fn subscribe_to_chat(state: &Arc<AppState>, chat_id: i64, tx: mpsc::Sender<Vec<u8>>, subs: &Arc<Subscriptions>) {
+    {
+        let mut chat_ids = subs.chat_ids.lock().await;
+        if !chat_ids.insert(chat_id) {
+            return;
         }
     }
-    handles
+
+    let subject = format!("chat.{chat_id}");
+    match state.nats.subscribe(subject.clone()).await {
+        Ok(mut subscriber) => {
+            let handle = tokio::spawn(async move {
+                while let Some(message) = subscriber.next().await {
+                    if tx.send(message.payload.to_vec()).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            subs.handles.lock().await.push(handle);
+        }
+        Err(err) => tracing::warn!(?err, %subject, "failed to subscribe to chat"),
+    }
 }
 
 /// Persists the message, then publishes it to NATS instead of replying on

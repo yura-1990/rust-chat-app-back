@@ -22,6 +22,8 @@ use state::AppState;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    dotenvy::dotenv().ok();
+
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -51,11 +53,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/auth/login", post(http::login))
         .route("/me", get(http::me))
         .route("/users/lookup", get(http::lookup_user))
+        .route("/users/search", get(http::search_users))
         .route("/chats", get(http::list_chats))
         .route("/chats/direct", post(http::create_direct_chat))
         .route("/chats/saved", post(http::get_or_create_saved_messages))
         .route("/chats/{chat_id}/messages", get(http::list_messages))
         .route("/chats/{chat_id}/clear", post(http::clear_chat))
+        .route("/chats/{chat_id}/archive", post(http::archive_chat))
+        .route("/chats/{chat_id}/unarchive", post(http::unarchive_chat))
         .route("/chats/{chat_id}", delete(http::leave_chat))
         .route(
             "/chats/{chat_id}/media",

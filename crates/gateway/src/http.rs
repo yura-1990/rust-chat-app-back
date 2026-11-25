@@ -51,6 +51,15 @@ pub async fn login(State(state): State<Arc<AppState>>, Json(body): Json<Credenti
     }
 }
 
+async fn notify_new_chat(state: &Arc<AppState>, chat_id: i64, member_ids: &[i64]) {
+    for member_id in member_ids {
+        let subject = format!("user.{member_id}.new_chat");
+        if let Err(err) = state.nats.publish(subject.clone(), chat_id.to_string().into()).await {
+            tracing::warn!(?err, %subject, "failed to notify member of new chat");
+        }
+    }
+}
+
 fn auth_error_response(err: AuthError) -> Response {
     let status = match err {
         AuthError::UsernameTaken => StatusCode::CONFLICT,
@@ -91,10 +100,18 @@ pub async fn create_direct_chat(
     }
 
     match state.chat.get_or_create_direct_chat(user_id, with_user_id).await {
-        Ok(chat_id) => Json(ChatResponse {
-            chat_id: chat_id.to_string(),
-        })
-        .into_response(),
+        Ok(chat_id) => {
+            // Tells any already-connected sockets for either member to
+            // subscribe to this chat's NATS subject — without this, a
+            // connection opened before the chat existed never learns about
+            // it (it only snapshots memberships once, at `Hello`), so the
+            // other side wouldn't see messages until they reconnect.
+            notify_new_chat(&state, chat_id, &[user_id, with_user_id]).await;
+            Json(ChatResponse {
+                chat_id: chat_id.to_string(),
+            })
+            .into_response()
+        }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -253,6 +270,7 @@ pub struct ChatSummaryView {
     pub other_username: String,
     pub last_message: Option<LastMessageView>,
     pub is_self: bool,
+    pub is_archived: bool,
 }
 
 #[derive(Serialize)]
@@ -284,6 +302,7 @@ pub async fn list_chats(State(state): State<Arc<AppState>>, headers: HeaderMap) 
                         deleted: m.deleted,
                     }),
                     is_self: c.is_self,
+                    is_archived: c.is_archived,
                 })
                 .collect::<Vec<_>>(),
         )
@@ -305,6 +324,38 @@ pub async fn clear_chat(State(state): State<Arc<AppState>>, headers: HeaderMap, 
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
     match state.chat.clear_chat(chat_id, user_id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+pub async fn archive_chat(State(state): State<Arc<AppState>>, headers: HeaderMap, Path(chat_id): Path<i64>) -> Response {
+    let user_id = match bearer_user(&headers, &state.auth) {
+        Ok(id) => id,
+        Err(status) => return status.into_response(),
+    };
+    match state.chat.is_member(chat_id, user_id).await {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::FORBIDDEN.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    match state.chat.archive_chat(chat_id, user_id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+pub async fn unarchive_chat(State(state): State<Arc<AppState>>, headers: HeaderMap, Path(chat_id): Path<i64>) -> Response {
+    let user_id = match bearer_user(&headers, &state.auth) {
+        Ok(id) => id,
+        Err(status) => return status.into_response(),
+    };
+    match state.chat.is_member(chat_id, user_id).await {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::FORBIDDEN.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    match state.chat.unarchive_chat(chat_id, user_id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -354,6 +405,40 @@ pub async fn lookup_user(
         })
         .into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct SearchUsersQuery {
+    pub q: String,
+}
+
+pub async fn search_users(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<SearchUsersQuery>,
+) -> Response {
+    let user_id = match bearer_user(&headers, &state.auth) {
+        Ok(id) => id,
+        Err(status) => return status.into_response(),
+    };
+    let q = query.q.trim();
+    if q.is_empty() {
+        return Json(Vec::<UserView>::new()).into_response();
+    }
+
+    match state.auth.search_users(q, user_id, 10).await {
+        Ok(users) => Json(
+            users
+                .into_iter()
+                .map(|u| UserView {
+                    user_id: u.user_id.to_string(),
+                    username: u.username,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }

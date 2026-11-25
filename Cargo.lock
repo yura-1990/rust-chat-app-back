@@ -832,6 +832,7 @@ dependencies = [
  "chat-common",
  "chat-proto",
  "chat-service",
+ "dotenvy",
  "futures-util",
  "hex",
  "hmac 0.13.0",
