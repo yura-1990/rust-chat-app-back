@@ -768,6 +768,44 @@ pub struct MessageView {
     pub edited_at_ms: Option<i64>,
     pub deleted: bool,
     pub kind: String,
+    pub pinned: bool,
+}
+
+// Shared by `list_messages` and `list_pinned_messages` — same shape either
+// way, just a different source query.
+fn message_view(state: &AppState, chat_id: i64, m: chat_service::Message) -> MessageView {
+    MessageView {
+        id: m.id.to_string(),
+        chat_id: chat_id.to_string(),
+        author_id: m.author_id.to_string(),
+        text: m.text,
+        created_at_ms: m.created_at_ms,
+        media: m.media.map(|media| MediaView {
+            media_id: media.media_id.to_string(),
+            kind: media.kind,
+            mime: media.mime,
+            name: media.name,
+            size: media.size,
+            duration_ms: media.duration_ms,
+            url: state.media.signed_url(chat_id, media.media_id),
+        }),
+        reply_to_id: m.reply_to_id.map(|id| id.to_string()),
+        reply_preview: m.reply_preview.map(|r| ReplyPreviewView {
+            message_id: r.message_id.to_string(),
+            author_id: r.author_id.to_string(),
+            text: r.text,
+            media_kind: r.media_kind,
+            deleted: r.deleted,
+        }),
+        forwarded_from: m.forwarded_from.map(|f| ForwardedFromView {
+            user_id: f.user_id.to_string(),
+            username: f.username,
+        }),
+        edited_at_ms: m.edited_at_ms,
+        deleted: m.deleted_at_ms.is_some(),
+        kind: m.kind,
+        pinned: m.pinned_at_ms.is_some(),
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -806,37 +844,7 @@ pub async fn list_messages(
         Ok(messages) => Json(
             messages
                 .into_iter()
-                .map(|m| MessageView {
-                    id: m.id.to_string(),
-                    chat_id: m.chat_id.to_string(),
-                    author_id: m.author_id.to_string(),
-                    text: m.text,
-                    created_at_ms: m.created_at_ms,
-                    media: m.media.map(|media| MediaView {
-                        media_id: media.media_id.to_string(),
-                        kind: media.kind,
-                        mime: media.mime,
-                        name: media.name,
-                        size: media.size,
-                        duration_ms: media.duration_ms,
-                        url: state.media.signed_url(chat_id, media.media_id),
-                    }),
-                    reply_to_id: m.reply_to_id.map(|id| id.to_string()),
-                    reply_preview: m.reply_preview.map(|r| ReplyPreviewView {
-                        message_id: r.message_id.to_string(),
-                        author_id: r.author_id.to_string(),
-                        text: r.text,
-                        media_kind: r.media_kind,
-                        deleted: r.deleted,
-                    }),
-                    forwarded_from: m.forwarded_from.map(|f| ForwardedFromView {
-                        user_id: f.user_id.to_string(),
-                        username: f.username,
-                    }),
-                    edited_at_ms: m.edited_at_ms,
-                    deleted: m.deleted_at_ms.is_some(),
-                    kind: m.kind,
-                })
+                .map(|m| message_view(&state, chat_id, m))
                 .collect::<Vec<_>>(),
         )
         .into_response(),
@@ -1009,6 +1017,79 @@ pub async fn clear_chat(State(state): State<Arc<AppState>>, headers: HeaderMap, 
     }
 }
 
+/// Pins a message chat-wide — every member sees it in `GET
+/// .../pinned`, not just the caller (unlike clearing/archiving, which are
+/// per-member). No realtime push yet (see README's Known Phase 1
+/// simplifications): other members pick up the change next time they open
+/// or refetch the chat.
+pub async fn pin_message(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((chat_id, message_id)): Path<(i64, i64)>,
+) -> Response {
+    let user_id = match bearer_user(&headers, &state.auth) {
+        Ok(id) => id,
+        Err(status) => return status.into_response(),
+    };
+    match state.chat.is_member(chat_id, user_id).await {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::FORBIDDEN.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    match state.chat.pin_message(chat_id, message_id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+pub async fn unpin_message(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((chat_id, message_id)): Path<(i64, i64)>,
+) -> Response {
+    let user_id = match bearer_user(&headers, &state.auth) {
+        Ok(id) => id,
+        Err(status) => return status.into_response(),
+    };
+    match state.chat.is_member(chat_id, user_id).await {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::FORBIDDEN.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    match state.chat.unpin_message(chat_id, message_id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// Every currently pinned message in the chat, oldest pin first — what the
+/// frontend's pinned-message bar cycles through on repeated clicks.
+pub async fn list_pinned_messages(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(chat_id): Path<i64>,
+) -> Response {
+    let user_id = match bearer_user(&headers, &state.auth) {
+        Ok(id) => id,
+        Err(status) => return status.into_response(),
+    };
+    match state.chat.is_member(chat_id, user_id).await {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::FORBIDDEN.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    match state.chat.pinned_messages(chat_id).await {
+        Ok(messages) => Json(
+            messages
+                .into_iter()
+                .map(|m| message_view(&state, chat_id, m))
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
 /// Marks this chat as read up to its current latest message — called when
 /// the caller opens/focuses it. Affects `unread_count` in the next
 /// `GET /chats`, including from another of this caller's own sessions.
@@ -1142,6 +1223,40 @@ pub async fn search_users(
     match state.auth.search_users(q, user_id, 10).await {
         Ok(users) => Json(users.into_iter().map(|u| user_view(&state, u)).collect::<Vec<_>>()).into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct LinkPreviewQuery {
+    pub url: String,
+}
+
+/// Scrapes a message link's Open Graph metadata server-side (so the client
+/// never makes a cross-origin fetch itself, and arbitrary target hosts
+/// never see the gateway's own CORS/cookie context) and caches it by URL —
+/// repeated previews of the same link (every chat member rendering the same
+/// forwarded message) don't each trigger a fresh outbound fetch.
+pub async fn link_preview(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<LinkPreviewQuery>,
+) -> Response {
+    if bearer_user(&headers, &state.auth).is_err() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let url = query.url.trim().to_string();
+    if url.is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if let Some(cached) = state.link_previews.lock().unwrap().get(&url).cloned() {
+        return Json(cached).into_response();
+    }
+    match crate::link_preview::fetch(&state.link_preview_client, &url).await {
+        Some(preview) => {
+            state.link_previews.lock().unwrap().insert(url, preview.clone());
+            Json(preview).into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 

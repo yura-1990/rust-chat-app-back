@@ -1,5 +1,6 @@
 mod config;
 mod http;
+mod link_preview;
 mod media;
 mod state;
 mod ws;
@@ -44,6 +45,8 @@ async fn main() -> anyhow::Result<()> {
         nats,
         media: MediaStore::new(config.media_dir.into(), config.jwt_secret),
         media_ids: SnowflakeGenerator::new(3),
+        link_preview_client: link_preview::build_client(),
+        link_previews: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
     let app = Router::new()
@@ -64,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/me/avatars/{media_id}", delete(http::delete_my_avatar))
         .route("/users/lookup", get(http::lookup_user))
         .route("/users/search", get(http::search_users))
+        .route("/link-preview", get(http::link_preview))
         .route("/chats", get(http::list_chats))
         .route("/chats/direct", post(http::create_direct_chat))
         .route("/chats/saved", post(http::get_or_create_saved_messages))
@@ -83,6 +87,9 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/avatars/{media_id}", get(http::serve_avatar))
         .route("/chats/{chat_id}/messages", get(http::list_messages))
+        .route("/chats/{chat_id}/pinned", get(http::list_pinned_messages))
+        .route("/chats/{chat_id}/messages/{message_id}/pin", post(http::pin_message))
+        .route("/chats/{chat_id}/messages/{message_id}/unpin", post(http::unpin_message))
         .route("/chats/{chat_id}/clear", post(http::clear_chat))
         .route("/chats/{chat_id}/read", post(http::mark_chat_read))
         .route("/chats/{chat_id}/archive", post(http::archive_chat))

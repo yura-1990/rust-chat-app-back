@@ -27,3 +27,5 @@ hex = "0.4.3"
 dotenvy = "0.15.7"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 webp = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "charset"] }
+regex = "1"

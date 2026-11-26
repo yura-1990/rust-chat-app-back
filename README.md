@@ -66,6 +66,10 @@ dropped connection.
   this signal yet, and there's still no real `Subscribe`/`Unsubscribe` op
   for group chats with dynamic membership.
 - **No media crate yet** — presigned MinIO uploads are next.
+- **Pinning a message isn't pushed over the WS** — `POST
+  .../messages/{id}/pin`/`unpin` and `GET .../pinned` are plain HTTP, no
+  NATS broadcast. Other members see a pin/unpin change next time they open
+  or refetch the chat, not instantly like a sent message is.
 
 ## Running locally
 

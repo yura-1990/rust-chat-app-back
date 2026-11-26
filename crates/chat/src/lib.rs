@@ -48,6 +48,10 @@ pub struct Message {
     /// "text" for an ordinary authored message, "system" for a
     /// server-generated notice (e.g. "Alice created the group").
     pub kind: String,
+    /// When this message was pinned, `None` if it isn't currently pinned.
+    /// Chat-wide (not per-member, unlike `cleared_before_id`) — pinning is
+    /// a shared action every member sees, the same way Telegram's is.
+    pub pinned_at_ms: Option<i64>,
 }
 
 const REPLY_PREVIEW_MAX_CHARS: usize = 160;
@@ -732,6 +736,7 @@ impl ChatService {
             edited_at_ms: None,
             deleted_at_ms: None,
             kind: kind.to_string(),
+            pinned_at_ms: None,
         })
     }
 
@@ -767,19 +772,13 @@ impl ChatService {
         // of this many columns. The chat_members join brings in *this
         // caller's* cleared_before_id — clearing only ever hides history
         // from the clearer's own fetches, never the other member's.
-        const COLUMNS: &str = "m.id, m.chat_id, m.author_id, m.body, m.created_at_ms,
-             m.media_id, m.media_kind, m.media_mime, m.media_name, m.media_size, m.media_duration_ms,
-             m.reply_to_id, m.forwarded_from_user_id, m.forwarded_from_username,
-             m.edited_at_ms, m.deleted_at_ms, m.kind,
-             r.author_id as reply_author_id, r.body as reply_text, r.media_kind as reply_media_kind,
-             r.deleted_at_ms as reply_deleted_at_ms";
         const FROM: &str = "from messages m
              left join messages r on r.id = m.reply_to_id
              join chat_members cm on cm.chat_id = m.chat_id and cm.user_id = $2";
         let rows: Vec<MessageRow> = match before {
             Some(before) => {
                 sqlx::query_as(&format!(
-                    "select {COLUMNS} {FROM}
+                    "select {MESSAGE_COLUMNS} {FROM}
                      where m.chat_id = $1 and m.id > coalesce(cm.cleared_before_id, 0) and m.id < $3
                      order by m.id desc limit $4",
                 ))
@@ -792,7 +791,7 @@ impl ChatService {
             }
             None => {
                 sqlx::query_as(&format!(
-                    "select {COLUMNS} {FROM}
+                    "select {MESSAGE_COLUMNS} {FROM}
                      where m.chat_id = $1 and m.id > coalesce(cm.cleared_before_id, 0)
                      order by m.id desc limit $3",
                 ))
@@ -803,6 +802,49 @@ impl ChatService {
                 .await?
             }
         };
+        Ok(rows.into_iter().map(row_to_message).collect())
+    }
+
+    /// Pins (or re-pins) a message — chat-wide, visible to every member,
+    /// not gated per-caller the way clearing/archiving are. `pinned_at_ms`
+    /// also drives cycling order in `pinned_messages` (oldest pin first,
+    /// same as Telegram's pinned-message bar). Not membership-gated itself;
+    /// callers must `is_member`-gate this the same way `group_members` does.
+    pub async fn pin_message(&self, chat_id: i64, message_id: i64) -> Result<(), ChatError> {
+        sqlx::query(
+            "update messages set pinned_at_ms = $3
+             where id = $1 and chat_id = $2 and deleted_at_ms is null",
+        )
+        .bind(message_id)
+        .bind(chat_id)
+        .bind(now_ms())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn unpin_message(&self, chat_id: i64, message_id: i64) -> Result<(), ChatError> {
+        sqlx::query("update messages set pinned_at_ms = null where id = $1 and chat_id = $2")
+            .bind(message_id)
+            .bind(chat_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Every currently pinned message in the chat, oldest pin first — the
+    /// order the pinned-message bar cycles through on repeated clicks.
+    pub async fn pinned_messages(&self, chat_id: i64) -> Result<Vec<Message>, ChatError> {
+        let rows: Vec<MessageRow> = sqlx::query_as(&format!(
+            "select {MESSAGE_COLUMNS}
+             from messages m
+             left join messages r on r.id = m.reply_to_id
+             where m.chat_id = $1 and m.pinned_at_ms is not null and m.deleted_at_ms is null
+             order by m.pinned_at_ms asc",
+        ))
+        .bind(chat_id)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows.into_iter().map(row_to_message).collect())
     }
 
@@ -1055,6 +1097,18 @@ pub struct DeletedMessage {
     pub old_media: Option<MediaRef>,
 }
 
+// Shared by `recent_messages` and `pinned_messages` — aliased (not a plain
+// tuple) because sqlx's tuple FromRow impl stops well short of this many
+// columns. The reply preview is resolved inline via the self-join on `r`,
+// matching on `r.id` — one query, no N+1; rows with no reply_to_id simply
+// join nothing.
+const MESSAGE_COLUMNS: &str = "m.id, m.chat_id, m.author_id, m.body, m.created_at_ms,
+     m.media_id, m.media_kind, m.media_mime, m.media_name, m.media_size, m.media_duration_ms,
+     m.reply_to_id, m.forwarded_from_user_id, m.forwarded_from_username,
+     m.edited_at_ms, m.deleted_at_ms, m.kind, m.pinned_at_ms,
+     r.author_id as reply_author_id, r.body as reply_text, r.media_kind as reply_media_kind,
+     r.deleted_at_ms as reply_deleted_at_ms";
+
 #[derive(sqlx::FromRow)]
 struct MessageRow {
     id: i64,
@@ -1074,6 +1128,7 @@ struct MessageRow {
     edited_at_ms: Option<i64>,
     deleted_at_ms: Option<i64>,
     kind: String,
+    pinned_at_ms: Option<i64>,
     reply_author_id: Option<i64>,
     reply_text: Option<String>,
     reply_media_kind: Option<String>,
@@ -1113,6 +1168,7 @@ fn row_to_message(row: MessageRow) -> Message {
         edited_at_ms: row.edited_at_ms,
         deleted_at_ms: row.deleted_at_ms,
         kind: row.kind,
+        pinned_at_ms: row.pinned_at_ms,
     }
 }
 
