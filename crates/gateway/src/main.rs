@@ -52,13 +52,39 @@ async fn main() -> anyhow::Result<()> {
         .route("/auth/register", post(http::register))
         .route("/auth/login", post(http::login))
         .route("/me", get(http::me))
+        .route("/me/handle", post(http::set_handle))
+        .route("/me/bio", post(http::set_bio))
+        .route(
+            "/me/avatars",
+            post(http::upload_my_avatar)
+                .get(http::list_my_avatars)
+                .route_layer(DefaultBodyLimit::max(media::AVATAR_MAX_UPLOAD_BYTES)),
+        )
+        .route("/me/avatars/{media_id}/activate", post(http::activate_my_avatar))
+        .route("/me/avatars/{media_id}", delete(http::delete_my_avatar))
         .route("/users/lookup", get(http::lookup_user))
         .route("/users/search", get(http::search_users))
         .route("/chats", get(http::list_chats))
         .route("/chats/direct", post(http::create_direct_chat))
         .route("/chats/saved", post(http::get_or_create_saved_messages))
+        .route("/chats/group", post(http::create_group_chat))
+        .route("/chats/channel", post(http::create_channel_chat))
+        .route("/chats/{chat_id}/members", get(http::list_group_members))
+        .route("/chats/{chat_id}/handle", post(http::set_channel_handle))
+        .route(
+            "/chats/{chat_id}/admins/{user_id}",
+            post(http::promote_member).delete(http::demote_member),
+        )
+        .route("/chats/{chat_id}/join", post(http::join_channel))
+        .route("/channels/{handle}", get(http::find_channel_by_handle))
+        .route(
+            "/groups/avatar",
+            post(http::upload_group_avatar).route_layer(DefaultBodyLimit::max(media::AVATAR_MAX_UPLOAD_BYTES)),
+        )
+        .route("/avatars/{media_id}", get(http::serve_avatar))
         .route("/chats/{chat_id}/messages", get(http::list_messages))
         .route("/chats/{chat_id}/clear", post(http::clear_chat))
+        .route("/chats/{chat_id}/read", post(http::mark_chat_read))
         .route("/chats/{chat_id}/archive", post(http::archive_chat))
         .route("/chats/{chat_id}/unarchive", post(http::unarchive_chat))
         .route("/chats/{chat_id}", delete(http::leave_chat))

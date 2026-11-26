@@ -1,12 +1,17 @@
 use std::sync::Arc;
 
+use axum::body::Bytes;
 use axum::extract::{Json, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chat_auth::AuthError;
+use chat_proto::chat::v1::envelope::Payload;
+use chat_proto::chat::v1::{Envelope, MessageCreated, Op};
 use serde::{Deserialize, Serialize};
 
+use crate::media;
 use crate::state::AppState;
+use crate::ws::publish_to_chat;
 
 // Snowflake IDs are 64-bit and routinely exceed Number.MAX_SAFE_INTEGER
 // (2^53). Returned as JSON numbers they'd get silently rounded by every JS
@@ -60,11 +65,16 @@ async fn notify_new_chat(state: &Arc<AppState>, chat_id: i64, member_ids: &[i64]
     }
 }
 
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+}
+
 fn auth_error_response(err: AuthError) -> Response {
     let status = match err {
-        AuthError::UsernameTaken => StatusCode::CONFLICT,
+        AuthError::UsernameTaken | AuthError::HandleTaken => StatusCode::CONFLICT,
         AuthError::InvalidCredentials | AuthError::InvalidToken => StatusCode::UNAUTHORIZED,
-        AuthError::WeakPassword => StatusCode::BAD_REQUEST,
+        AuthError::WeakPassword | AuthError::InvalidHandle | AuthError::BioTooLong => StatusCode::BAD_REQUEST,
         AuthError::Database(_) | AuthError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (status, err.to_string()).into_response()
@@ -132,6 +142,592 @@ pub async fn get_or_create_saved_messages(State(state): State<Arc<AppState>>, he
     }
 }
 
+#[derive(Deserialize)]
+pub struct CreateGroupChat {
+    pub title: String,
+    pub description: Option<String>,
+    pub avatar_media_id: Option<String>,
+    pub member_user_ids: Vec<String>,
+}
+
+/// "Alice", "Alice and Bob", "Alice, Bob, and Carol" — the small
+/// comma-plus-"and" join every system-message sentence below uses to list
+/// the people involved.
+fn join_names(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [a] => a.clone(),
+        [a, b] => format!("{a} and {b}"),
+        _ => {
+            let (last, rest) = names.split_last().expect("non-empty slice");
+            format!("{}, and {last}", rest.join(", "))
+        }
+    }
+}
+
+/// Builds a `MessageCreated{ kind: "system" }` envelope from an already-
+/// persisted system message and broadcasts it to the chat's NATS subject —
+/// the same delivery path `ws::handle_send_message` uses, just invoked from
+/// the HTTP side for group creation, where there's no open WS frame to
+/// react to in the first place.
+async fn broadcast_system_message(state: &Arc<AppState>, message: chat_service::Message) {
+    let envelope = Envelope {
+        op: Op::MessageCreated as i32,
+        seq: 0,
+        payload: Some(Payload::MessageCreated(MessageCreated {
+            id: message.id as u64,
+            chat_id: message.chat_id as u64,
+            author_id: message.author_id as u64,
+            text: message.text,
+            created_at_ms: message.created_at_ms,
+            client_nonce: String::new(),
+            media: None,
+            reply_to_id: 0,
+            reply_preview: None,
+            forwarded_from: None,
+            kind: message.kind,
+        })),
+    };
+    if let Err(err) = publish_to_chat(state, message.chat_id, &envelope).await {
+        tracing::warn!(?err, chat_id = message.chat_id, "failed to broadcast group system message");
+    }
+}
+
+/// Creates a group chat: the caller becomes its owner, every id in
+/// `member_user_ids` joins as a plain member. A "<creator> created the
+/// group and added <names>" system message is persisted and broadcast, and
+/// every member (including the creator, for consistency with how
+/// `create_direct_chat` already notifies both sides) gets a `new_chat`
+/// ping so an already-open session picks it up without reconnecting.
+pub async fn create_group_chat(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<CreateGroupChat>,
+) -> Response {
+    let claims = match bearer_claims(&headers, &state.auth) {
+        Ok(claims) => claims,
+        Err(status) => return status.into_response(),
+    };
+    let creator_id = claims.user_id;
+
+    let title = body.title.trim();
+    if title.is_empty() {
+        return (StatusCode::BAD_REQUEST, "title is required").into_response();
+    }
+    let description = body.description.as_deref().map(str::trim).filter(|d| !d.is_empty());
+
+    let avatar_media_id = match body.avatar_media_id.map(|id| id.parse::<i64>()) {
+        Some(Ok(id)) => Some(id),
+        Some(Err(_)) => return (StatusCode::BAD_REQUEST, "avatar_media_id must be a numeric id").into_response(),
+        None => None,
+    };
+
+    let mut member_ids = Vec::new();
+    for raw in &body.member_user_ids {
+        let Ok(id) = raw.parse::<i64>() else {
+            return (StatusCode::BAD_REQUEST, "member_user_ids must be numeric ids").into_response();
+        };
+        if id != creator_id && !member_ids.contains(&id) {
+            member_ids.push(id);
+        }
+    }
+
+    for &member_id in &member_ids {
+        match state.chat.is_blocked(creator_id, member_id).await {
+            Ok(true) => return (StatusCode::FORBIDDEN, "blocked").into_response(),
+            Ok(false) => {}
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    }
+
+    let chat_id = match state
+        .chat
+        .create_group_chat(creator_id, title, description, avatar_media_id, &member_ids)
+        .await
+    {
+        Ok(chat_id) => chat_id,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    let member_names = match state.auth.usernames_for_ids(&member_ids).await {
+        Ok(users) => users.into_iter().map(|u| u.username).collect::<Vec<_>>(),
+        Err(_) => Vec::new(),
+    };
+    let body_text = if member_names.is_empty() {
+        format!("{} created the group", claims.username)
+    } else {
+        format!("{} created the group and added {}", claims.username, join_names(&member_names))
+    };
+    match state.chat.insert_system_message(chat_id, creator_id, body_text).await {
+        Ok(message) => broadcast_system_message(&state, message).await,
+        Err(err) => tracing::warn!(?err, chat_id, "failed to persist group-created system message"),
+    }
+
+    let mut all_member_ids = member_ids;
+    all_member_ids.push(creator_id);
+    notify_new_chat(&state, chat_id, &all_member_ids).await;
+
+    Json(ChatResponse {
+        chat_id: chat_id.to_string(),
+    })
+    .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct CreateChannelChat {
+    pub title: String,
+    pub description: Option<String>,
+    pub avatar_media_id: Option<String>,
+    pub handle: Option<String>,
+    #[serde(default)]
+    pub member_user_ids: Vec<String>,
+}
+
+fn chat_error_response(err: chat_service::ChatError) -> Response {
+    use chat_service::ChatError;
+    match err {
+        ChatError::HandleTaken => (StatusCode::CONFLICT, "handle already taken").into_response(),
+        ChatError::InvalidHandle => (
+            StatusCode::BAD_REQUEST,
+            "handle must be 3-32 lowercase letters, digits, or underscores, starting with a letter",
+        )
+            .into_response(),
+        ChatError::NotOwner => (StatusCode::FORBIDDEN, "only the owner can do that").into_response(),
+        ChatError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// Creates a channel: the caller becomes its owner, every id in
+/// `member_user_ids` joins as a plain subscriber (`member_user_ids` may be
+/// empty — unlike a group, a channel can start with zero subscribers). An
+/// optional public `@handle` can be set at creation time, same validation
+/// as a user's own handle. Otherwise identical to `create_group_chat`: same
+/// system-message + `notify_new_chat` sequence.
+pub async fn create_channel_chat(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<CreateChannelChat>,
+) -> Response {
+    let claims = match bearer_claims(&headers, &state.auth) {
+        Ok(claims) => claims,
+        Err(status) => return status.into_response(),
+    };
+    let creator_id = claims.user_id;
+
+    let title = body.title.trim();
+    if title.is_empty() {
+        return (StatusCode::BAD_REQUEST, "title is required").into_response();
+    }
+    let description = body.description.as_deref().map(str::trim).filter(|d| !d.is_empty());
+    let handle = body.handle.as_deref().map(|h| h.trim_start_matches('@')).filter(|h| !h.is_empty());
+
+    let avatar_media_id = match body.avatar_media_id.map(|id| id.parse::<i64>()) {
+        Some(Ok(id)) => Some(id),
+        Some(Err(_)) => return (StatusCode::BAD_REQUEST, "avatar_media_id must be a numeric id").into_response(),
+        None => None,
+    };
+
+    let mut member_ids = Vec::new();
+    for raw in &body.member_user_ids {
+        let Ok(id) = raw.parse::<i64>() else {
+            return (StatusCode::BAD_REQUEST, "member_user_ids must be numeric ids").into_response();
+        };
+        if id != creator_id && !member_ids.contains(&id) {
+            member_ids.push(id);
+        }
+    }
+
+    for &member_id in &member_ids {
+        match state.chat.is_blocked(creator_id, member_id).await {
+            Ok(true) => return (StatusCode::FORBIDDEN, "blocked").into_response(),
+            Ok(false) => {}
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    }
+
+    let chat_id = match state
+        .chat
+        .create_channel_chat(creator_id, title, description, avatar_media_id, handle, &member_ids)
+        .await
+    {
+        Ok(chat_id) => chat_id,
+        Err(err) => return chat_error_response(err),
+    };
+
+    let member_names = match state.auth.usernames_for_ids(&member_ids).await {
+        Ok(users) => users.into_iter().map(|u| u.username).collect::<Vec<_>>(),
+        Err(_) => Vec::new(),
+    };
+    let body_text = if member_names.is_empty() {
+        format!("{} created the channel", claims.username)
+    } else {
+        format!("{} created the channel and added {}", claims.username, join_names(&member_names))
+    };
+    match state.chat.insert_system_message(chat_id, creator_id, body_text).await {
+        Ok(message) => broadcast_system_message(&state, message).await,
+        Err(err) => tracing::warn!(?err, chat_id, "failed to persist channel-created system message"),
+    }
+
+    let mut all_member_ids = member_ids;
+    all_member_ids.push(creator_id);
+    notify_new_chat(&state, chat_id, &all_member_ids).await;
+
+    Json(ChatResponse {
+        chat_id: chat_id.to_string(),
+    })
+    .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct SetChannelHandleRequest {
+    pub handle: Option<String>,
+}
+
+pub async fn set_channel_handle(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(chat_id): Path<i64>,
+    Json(body): Json<SetChannelHandleRequest>,
+) -> Response {
+    let user_id = match bearer_user(&headers, &state.auth) {
+        Ok(id) => id,
+        Err(status) => return status.into_response(),
+    };
+    let handle = body.handle.as_deref().map(|h| h.trim_start_matches('@'));
+    match state.chat.set_channel_handle(chat_id, user_id, handle.filter(|h| !h.is_empty())).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => chat_error_response(err),
+    }
+}
+
+/// Owner-only. `user_id` in the path is the member being promoted to admin
+/// (able to post in the channel, same as the owner) — 404 if they're not
+/// currently an active member.
+/// Broadcasts "<target> is now a channel admin"/"<target> is no longer a
+/// channel admin" after a successful promote/demote — the same system-
+/// message path group/channel creation and joining already use. This is
+/// also how the *target's own* already-open session learns its role (and
+/// therefore whether it can post) just changed, without it having to
+/// reconnect or reload — the WS dispatcher refreshes chat summaries on any
+/// system message for a chat it already knows about.
+async fn broadcast_role_change(state: &Arc<AppState>, chat_id: i64, target_user_id: i64, promoted: bool) {
+    let username = match state.auth.usernames_for_ids(&[target_user_id]).await {
+        Ok(users) => users.into_iter().next().map(|u| u.username),
+        Err(_) => None,
+    };
+    let Some(username) = username else { return };
+    let body_text = if promoted {
+        format!("{username} is now a channel admin")
+    } else {
+        format!("{username} is no longer a channel admin")
+    };
+    match state.chat.insert_system_message(chat_id, target_user_id, body_text).await {
+        Ok(message) => broadcast_system_message(state, message).await,
+        Err(err) => tracing::warn!(?err, chat_id, "failed to persist role-change system message"),
+    }
+}
+
+pub async fn promote_member(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((chat_id, target_user_id)): Path<(i64, i64)>,
+) -> Response {
+    let user_id = match bearer_user(&headers, &state.auth) {
+        Ok(id) => id,
+        Err(status) => return status.into_response(),
+    };
+    match state.chat.promote_member(chat_id, user_id, target_user_id).await {
+        Ok(true) => {
+            broadcast_role_change(&state, chat_id, target_user_id, true).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(err) => chat_error_response(err),
+    }
+}
+
+/// Owner-only — the inverse of `promote_member`, back to a plain subscriber.
+pub async fn demote_member(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((chat_id, target_user_id)): Path<(i64, i64)>,
+) -> Response {
+    let user_id = match bearer_user(&headers, &state.auth) {
+        Ok(id) => id,
+        Err(status) => return status.into_response(),
+    };
+    match state.chat.demote_member(chat_id, user_id, target_user_id).await {
+        Ok(true) => {
+            broadcast_role_change(&state, chat_id, target_user_id, false).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(err) => chat_error_response(err),
+    }
+}
+
+#[derive(Serialize)]
+pub struct ChannelPreviewView {
+    pub chat_id: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub avatar_url: Option<String>,
+    pub member_count: i64,
+    pub handle: String,
+}
+
+/// Public lookup by `@handle` — any logged-in user, no membership required.
+/// Only ever finds a channel that has chosen to set a public handle (see
+/// `ChatService::find_channel_by_handle`); a private/invite-only channel
+/// simply isn't reachable this way.
+pub async fn find_channel_by_handle(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(handle): Path<String>,
+) -> Response {
+    if bearer_user(&headers, &state.auth).is_err() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let handle = handle.trim_start_matches('@');
+    match state.chat.find_channel_by_handle(handle).await {
+        Ok(Some(preview)) => Json(ChannelPreviewView {
+            chat_id: preview.chat_id.to_string(),
+            title: preview.title,
+            description: preview.description,
+            avatar_url: preview.avatar_media_id.map(|id| state.media.avatar_url(id)),
+            member_count: preview.member_count,
+            handle: preview.handle,
+        })
+        .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// Subscribes the caller to a public channel found via `find_channel_by_handle`
+/// — 404 if `chat_id` isn't actually a public (handle-having) channel.
+pub async fn join_channel(State(state): State<Arc<AppState>>, headers: HeaderMap, Path(chat_id): Path<i64>) -> Response {
+    let claims = match bearer_claims(&headers, &state.auth) {
+        Ok(claims) => claims,
+        Err(status) => return status.into_response(),
+    };
+    let user_id = claims.user_id;
+    match state.chat.join_channel(chat_id, user_id).await {
+        Ok(true) => {
+            // So an already-open session (this user's other tabs/devices)
+            // picks up the new subscription without reconnecting — same
+            // ping `create_group_chat`/`create_channel_chat` send every
+            // member for the same reason.
+            notify_new_chat(&state, chat_id, &[user_id]).await;
+            // A system notice broadcast to the channel's existing
+            // subscribers (the same path group/channel creation already
+            // uses) — this is also how an already-open owner/admin session
+            // learns the subscriber count just changed, since nothing else
+            // pings them when someone joins on their own via handle.
+            let body_text = format!("{} joined the channel", claims.username);
+            match state.chat.insert_system_message(chat_id, user_id, body_text).await {
+                Ok(message) => broadcast_system_message(&state, message).await,
+                Err(err) => tracing::warn!(?err, chat_id, "failed to persist channel-joined system message"),
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+#[derive(Serialize)]
+pub struct AvatarUploadResponse {
+    pub avatar_media_id: String,
+}
+
+/// Validates (real image decode, not just a declared Content-Type) and
+/// optimizes an avatar image — see `media::optimize_avatar` — then stores
+/// it under its own media id. Returned `avatar_media_id` is passed into
+/// `POST /chats/group`'s `avatar_media_id` field; it isn't attached to a
+/// group until that call succeeds, so an avatar uploaded but never used in
+/// a successful group creation is simply orphaned on disk (no cleanup job
+/// exists yet — same category of simplification as this repo's other
+/// Phase 1 gaps).
+pub async fn upload_group_avatar(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
+    if bearer_user(&headers, &state.auth).is_err() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if body.len() > media::AVATAR_MAX_UPLOAD_BYTES {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "avatar exceeds the 8 MB limit").into_response();
+    }
+
+    let optimized = match media::optimize_avatar(&body) {
+        Ok(bytes) => bytes,
+        Err(_) => return (StatusCode::BAD_REQUEST, "that doesn't look like a valid image").into_response(),
+    };
+
+    let media_id = state.media_ids.next_id();
+    if let Err(err) = state.media.store_avatar(media_id, &optimized).await {
+        tracing::error!(?err, "failed to store group avatar");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    Json(AvatarUploadResponse {
+        avatar_media_id: media_id.to_string(),
+    })
+    .into_response()
+}
+
+/// Unauthenticated by design — see `MediaStore::avatar_url`'s doc comment.
+pub async fn serve_avatar(State(state): State<Arc<AppState>>, Path(media_id): Path<i64>) -> Response {
+    match state.media.load_avatar(media_id).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "image/webp".to_string()),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+                (header::CACHE_CONTROL, "public, max-age=86400".to_string()),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+#[derive(Serialize)]
+pub struct AvatarView {
+    pub media_id: String,
+    pub avatar_url: String,
+    pub is_active: bool,
+    pub created_at_ms: i64,
+}
+
+/// Uploads a new photo into the caller's personal gallery and makes it
+/// the active avatar — same validate/resize/WebP pipeline as
+/// `upload_group_avatar`, just filed under the uploader's own gallery
+/// (`chat_auth::AuthService::add_avatar`) instead of a group.
+pub async fn upload_my_avatar(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
+    let user_id = match bearer_user(&headers, &state.auth) {
+        Ok(id) => id,
+        Err(status) => return status.into_response(),
+    };
+    if body.len() > media::AVATAR_MAX_UPLOAD_BYTES {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "avatar exceeds the 8 MB limit").into_response();
+    }
+
+    let optimized = match media::optimize_avatar(&body) {
+        Ok(bytes) => bytes,
+        Err(_) => return (StatusCode::BAD_REQUEST, "that doesn't look like a valid image").into_response(),
+    };
+
+    let media_id = state.media_ids.next_id();
+    if let Err(err) = state.media.store_avatar(media_id, &optimized).await {
+        tracing::error!(?err, "failed to store avatar");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    if let Err(err) = state.auth.add_avatar(user_id, media_id).await {
+        tracing::error!(?err, "failed to record avatar");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    Json(AvatarView {
+        media_id: media_id.to_string(),
+        avatar_url: state.media.avatar_url(media_id),
+        is_active: true,
+        created_at_ms: now_ms(),
+    })
+    .into_response()
+}
+
+pub async fn list_my_avatars(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let user_id = match bearer_user(&headers, &state.auth) {
+        Ok(id) => id,
+        Err(status) => return status.into_response(),
+    };
+    match state.auth.list_avatars(user_id).await {
+        Ok(avatars) => Json(
+            avatars
+                .into_iter()
+                .map(|a| AvatarView {
+                    media_id: a.media_id.to_string(),
+                    avatar_url: state.media.avatar_url(a.media_id),
+                    is_active: a.is_active,
+                    created_at_ms: a.created_at_ms,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+pub async fn activate_my_avatar(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(media_id): Path<i64>,
+) -> Response {
+    let user_id = match bearer_user(&headers, &state.auth) {
+        Ok(id) => id,
+        Err(status) => return status.into_response(),
+    };
+    match state.auth.set_active_avatar(user_id, media_id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+pub async fn delete_my_avatar(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(media_id): Path<i64>,
+) -> Response {
+    let user_id = match bearer_user(&headers, &state.auth) {
+        Ok(id) => id,
+        Err(status) => return status.into_response(),
+    };
+    if let Err(err) = state.auth.delete_avatar(user_id, media_id).await {
+        tracing::error!(?err, "failed to delete avatar");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    state.media.delete_avatar(media_id).await;
+    StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(Serialize)]
+pub struct GroupMemberView {
+    pub user_id: String,
+    pub username: String,
+    pub role: String,
+}
+
+pub async fn list_group_members(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(chat_id): Path<i64>,
+) -> Response {
+    let user_id = match bearer_user(&headers, &state.auth) {
+        Ok(id) => id,
+        Err(status) => return status.into_response(),
+    };
+    match state.chat.is_member(chat_id, user_id).await {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::FORBIDDEN.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    match state.chat.group_members(chat_id).await {
+        Ok(members) => Json(
+            members
+                .into_iter()
+                .map(|(id, username, role)| GroupMemberView {
+                    user_id: id.to_string(),
+                    username,
+                    role,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
 #[derive(Serialize)]
 pub struct MediaView {
     pub media_id: String,
@@ -171,6 +767,7 @@ pub struct MessageView {
     pub forwarded_from: Option<ForwardedFromView>,
     pub edited_at_ms: Option<i64>,
     pub deleted: bool,
+    pub kind: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -238,6 +835,7 @@ pub async fn list_messages(
                     }),
                     edited_at_ms: m.edited_at_ms,
                     deleted: m.deleted_at_ms.is_some(),
+                    kind: m.kind,
                 })
                 .collect::<Vec<_>>(),
         )
@@ -250,27 +848,100 @@ pub async fn list_messages(
 pub struct MeResponse {
     pub user_id: String,
     pub username: String,
+    pub handle: Option<String>,
+    pub bio: Option<String>,
+    pub avatar_url: Option<String>,
 }
 
 pub async fn me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    match bearer_claims(&headers, &state.auth) {
-        Ok(claims) => Json(MeResponse {
-            user_id: claims.user_id.to_string(),
-            username: claims.username,
+    let claims = match bearer_claims(&headers, &state.auth) {
+        Ok(claims) => claims,
+        Err(status) => return status.into_response(),
+    };
+    match state.auth.find_by_id(claims.user_id).await {
+        Ok(Some(user)) => Json(MeResponse {
+            user_id: user.user_id.to_string(),
+            username: user.username,
+            handle: user.handle,
+            bio: user.bio,
+            avatar_url: user.active_avatar_media_id.map(|id| state.media.avatar_url(id)),
         })
         .into_response(),
-        Err(status) => status.into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct SetHandleRequest {
+    pub handle: Option<String>,
+}
+
+pub async fn set_handle(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<SetHandleRequest>,
+) -> Response {
+    let user_id = match bearer_user(&headers, &state.auth) {
+        Ok(id) => id,
+        Err(status) => return status.into_response(),
+    };
+    // Normalize the common "@handle" shorthand to the bare handle this is
+    // actually stored as — stripping a leading "@" here means callers
+    // never have to remember whether to include it.
+    let handle = body.handle.as_deref().map(|h| h.trim_start_matches('@'));
+    match state.auth.set_handle(user_id, handle.filter(|h| !h.is_empty())).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(AuthError::HandleTaken) => (StatusCode::CONFLICT, "handle already taken").into_response(),
+        Err(AuthError::InvalidHandle) => (
+            StatusCode::BAD_REQUEST,
+            "handle must be 3-32 lowercase letters, digits, or underscores, starting with a letter",
+        )
+            .into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct SetBioRequest {
+    pub bio: Option<String>,
+}
+
+pub async fn set_bio(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<SetBioRequest>,
+) -> Response {
+    let user_id = match bearer_user(&headers, &state.auth) {
+        Ok(id) => id,
+        Err(status) => return status.into_response(),
+    };
+    let bio = body.bio.as_deref().map(str::trim).filter(|b| !b.is_empty());
+    match state.auth.set_bio(user_id, bio).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(AuthError::BioTooLong) => (StatusCode::BAD_REQUEST, "bio must be 500 characters or fewer").into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
 #[derive(Serialize)]
 pub struct ChatSummaryView {
     pub chat_id: String,
-    pub other_user_id: String,
-    pub other_username: String,
+    /// `null` for a group/channel chat — there's no single "other" participant.
+    pub other_user_id: Option<String>,
+    pub other_username: Option<String>,
     pub last_message: Option<LastMessageView>,
     pub is_self: bool,
     pub is_archived: bool,
+    pub is_group: bool,
+    pub is_channel: bool,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub avatar_url: Option<String>,
+    pub member_count: i64,
+    pub handle: Option<String>,
+    pub my_role: Option<String>,
+    pub unread_count: i64,
 }
 
 #[derive(Serialize)]
@@ -287,13 +958,13 @@ pub async fn list_chats(State(state): State<Arc<AppState>>, headers: HeaderMap) 
         Err(status) => return status.into_response(),
     };
 
-    match state.chat.list_direct_chats_for_user(user_id).await {
+    match state.chat.list_chats_for_user(user_id).await {
         Ok(chats) => Json(
             chats
                 .into_iter()
                 .map(|c| ChatSummaryView {
                     chat_id: c.chat_id.to_string(),
-                    other_user_id: c.other_user_id.to_string(),
+                    other_user_id: c.other_user_id.map(|id| id.to_string()),
                     other_username: c.other_username,
                     last_message: c.last_message.map(|m| LastMessageView {
                         text: m.text,
@@ -303,6 +974,15 @@ pub async fn list_chats(State(state): State<Arc<AppState>>, headers: HeaderMap) 
                     }),
                     is_self: c.is_self,
                     is_archived: c.is_archived,
+                    is_group: c.is_group,
+                    is_channel: c.is_channel,
+                    title: c.title,
+                    description: c.description,
+                    avatar_url: c.avatar_media_id.map(|id| state.media.avatar_url(id)),
+                    member_count: c.member_count,
+                    handle: c.handle,
+                    my_role: c.my_role,
+                    unread_count: c.unread_count,
                 })
                 .collect::<Vec<_>>(),
         )
@@ -324,6 +1004,25 @@ pub async fn clear_chat(State(state): State<Arc<AppState>>, headers: HeaderMap, 
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
     match state.chat.clear_chat(chat_id, user_id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// Marks this chat as read up to its current latest message — called when
+/// the caller opens/focuses it. Affects `unread_count` in the next
+/// `GET /chats`, including from another of this caller's own sessions.
+pub async fn mark_chat_read(State(state): State<Arc<AppState>>, headers: HeaderMap, Path(chat_id): Path<i64>) -> Response {
+    let user_id = match bearer_user(&headers, &state.auth) {
+        Ok(id) => id,
+        Err(status) => return status.into_response(),
+    };
+    match state.chat.is_member(chat_id, user_id).await {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::FORBIDDEN.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    match state.chat.mark_chat_read(chat_id, user_id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -387,6 +1086,19 @@ pub struct LookupUserQuery {
 pub struct UserView {
     pub user_id: String,
     pub username: String,
+    pub handle: Option<String>,
+    pub bio: Option<String>,
+    pub avatar_url: Option<String>,
+}
+
+fn user_view(state: &AppState, user: chat_auth::UserSummary) -> UserView {
+    UserView {
+        user_id: user.user_id.to_string(),
+        username: user.username,
+        handle: user.handle,
+        bio: user.bio,
+        avatar_url: user.active_avatar_media_id.map(|id| state.media.avatar_url(id)),
+    }
 }
 
 pub async fn lookup_user(
@@ -399,11 +1111,7 @@ pub async fn lookup_user(
     }
 
     match state.auth.find_by_username(&query.username).await {
-        Ok(Some(user)) => Json(UserView {
-            user_id: user.user_id.to_string(),
-            username: user.username,
-        })
-        .into_response(),
+        Ok(Some(user)) => Json(user_view(&state, user)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -423,22 +1131,16 @@ pub async fn search_users(
         Ok(id) => id,
         Err(status) => return status.into_response(),
     };
-    let q = query.q.trim();
+    // A leading "@" is how a handle is normally shown/typed ("@alice") —
+    // strip it before matching so searching "@alice" and "alice" behave
+    // identically against both the username and handle columns.
+    let q = query.q.trim().trim_start_matches('@');
     if q.is_empty() {
         return Json(Vec::<UserView>::new()).into_response();
     }
 
     match state.auth.search_users(q, user_id, 10).await {
-        Ok(users) => Json(
-            users
-                .into_iter()
-                .map(|u| UserView {
-                    user_id: u.user_id.to_string(),
-                    username: u.username,
-                })
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
+        Ok(users) => Json(users.into_iter().map(|u| user_view(&state, u)).collect::<Vec<_>>()).into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }

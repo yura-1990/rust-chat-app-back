@@ -91,6 +91,7 @@ message MessageCreated {
   uint64 reply_to_id = 8; // 0 = not a reply
   ReplyPreview reply_preview = 9; // server-resolved snapshot of the replied-to message
   ForwardedFrom forwarded_from = 10;
+  string kind = 11; // "text" (default/empty) | "system" — a server-generated notice, not authored chat text
 }
 
 // A lightweight, server-computed snapshot of the message being replied

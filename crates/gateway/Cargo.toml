@@ -25,3 +25,5 @@ hmac = "0.13.0"
 sha2 = "0.11.1"
 hex = "0.4.3"
 dotenvy = "0.15.7"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+webp = "0.3"

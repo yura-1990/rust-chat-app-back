@@ -45,6 +45,9 @@ pub struct Message {
     pub forwarded_from: Option<ForwardedFromRef>,
     pub edited_at_ms: Option<i64>,
     pub deleted_at_ms: Option<i64>,
+    /// "text" for an ordinary authored message, "system" for a
+    /// server-generated notice (e.g. "Alice created the group").
+    pub kind: String,
 }
 
 const REPLY_PREVIEW_MAX_CHARS: usize = 160;
@@ -58,10 +61,11 @@ fn truncate_preview(text: &str) -> String {
 }
 
 #[derive(Debug, Clone)]
-pub struct DirectChatSummary {
+pub struct ChatSummary {
     pub chat_id: i64,
-    pub other_user_id: i64,
-    pub other_username: String,
+    /// `None` for a group/channel chat — there's no single "other" participant.
+    pub other_user_id: Option<i64>,
+    pub other_username: Option<String>,
     pub last_message: Option<LastMessage>,
     /// "Saved Messages" — a chat with no second member, used as a personal
     /// notes-to-self space (and, since it fans out over the same WS
@@ -70,6 +74,40 @@ pub struct DirectChatSummary {
     /// own identity in this case — there's no one else in the chat.
     pub is_self: bool,
     pub is_archived: bool,
+    pub is_group: bool,
+    /// A broadcast-style chat: only `owner`/`admin` members (see `my_role`)
+    /// may post; everyone else is a read-only subscriber. Mutually
+    /// exclusive with `is_group`.
+    pub is_channel: bool,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub avatar_media_id: Option<i64>,
+    pub member_count: i64,
+    /// A channel's public `@handle`, if it has one set — `None` means
+    /// invite-only (not joinable via `find_channel_by_handle`/`join_channel`).
+    /// Always `None` for direct/self/group chats.
+    pub handle: Option<String>,
+    /// This caller's own `chat_members.role` ("owner" | "admin" | "member"),
+    /// `None` for direct/self chats where role isn't tracked. Lets the
+    /// frontend decide "can I post here" (for a channel) without a second
+    /// round trip.
+    pub my_role: Option<String>,
+    /// Messages in this chat, not authored by the caller, with id greater
+    /// than their `last_read_message_id` — computed server-side so it
+    /// survives the caller being offline/disconnected when they arrived,
+    /// unlike a purely client-local "increment while connected" counter.
+    /// Always 0 for a self chat (every message in it is the caller's own).
+    pub unread_count: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelPreview {
+    pub chat_id: i64,
+    pub title: String,
+    pub description: Option<String>,
+    pub avatar_media_id: Option<i64>,
+    pub member_count: i64,
+    pub handle: String,
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +190,271 @@ impl ChatService {
         Ok(chat_id)
     }
 
+    /// Creates a new group chat: the creator becomes `role = 'owner'`,
+    /// everyone else in `member_ids` joins as a plain `'member'`. Unlike
+    /// direct chats, there's no reuse-detection — creating a group always
+    /// makes a brand new chat.
+    pub async fn create_group_chat(
+        &self,
+        creator_id: i64,
+        title: &str,
+        description: Option<&str>,
+        avatar_media_id: Option<i64>,
+        member_ids: &[i64],
+    ) -> Result<i64, ChatError> {
+        let chat_id = self.ids.next_id();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "insert into chats (id, kind, title, description, avatar_media_id, created_by)
+             values ($1, 'group', $2, $3, $4, $5)",
+        )
+        .bind(chat_id)
+        .bind(title)
+        .bind(description)
+        .bind(avatar_media_id)
+        .bind(creator_id)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("insert into chat_members (chat_id, user_id, role) values ($1, $2, 'owner')")
+            .bind(chat_id)
+            .bind(creator_id)
+            .execute(&mut *tx)
+            .await?;
+        for member_id in member_ids {
+            sqlx::query("insert into chat_members (chat_id, user_id, role) values ($1, $2, 'member')")
+                .bind(chat_id)
+                .bind(member_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        tx.commit().await?;
+        Ok(chat_id)
+    }
+
+    /// Creates a new channel: the creator becomes `role = 'owner'`, every id
+    /// in `member_ids` joins as a plain `'member'` (subscriber) — identical
+    /// shape to `create_group_chat`, except `kind = 'channel'`, an optional
+    /// public `handle` (validated the same way a user's own `@handle` is),
+    /// and `member_ids` may legitimately be empty (a channel can start with
+    /// zero subscribers, unlike a group).
+    pub async fn create_channel_chat(
+        &self,
+        creator_id: i64,
+        title: &str,
+        description: Option<&str>,
+        avatar_media_id: Option<i64>,
+        handle: Option<&str>,
+        member_ids: &[i64],
+    ) -> Result<i64, ChatError> {
+        if let Some(handle) = handle
+            && !is_valid_handle(handle)
+        {
+            return Err(ChatError::InvalidHandle);
+        }
+
+        let chat_id = self.ids.next_id();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "insert into chats (id, kind, title, description, avatar_media_id, created_by, handle)
+             values ($1, 'channel', $2, $3, $4, $5, $6)",
+        )
+        .bind(chat_id)
+        .bind(title)
+        .bind(description)
+        .bind(avatar_media_id)
+        .bind(creator_id)
+        .bind(handle)
+        .execute(&mut *tx)
+        .await
+        .map_err(|err| {
+            if is_unique_violation(&err) {
+                ChatError::HandleTaken
+            } else {
+                ChatError::Database(err)
+            }
+        })?;
+
+        sqlx::query("insert into chat_members (chat_id, user_id, role) values ($1, $2, 'owner')")
+            .bind(chat_id)
+            .bind(creator_id)
+            .execute(&mut *tx)
+            .await?;
+        for member_id in member_ids {
+            sqlx::query("insert into chat_members (chat_id, user_id, role) values ($1, $2, 'member')")
+                .bind(chat_id)
+                .bind(member_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        tx.commit().await?;
+        Ok(chat_id)
+    }
+
+    /// Owner-only: sets, changes, or (with `None`) clears a channel's public
+    /// `@handle` after creation. Same validate-then-unique-violation-catch
+    /// shape as `create_channel_chat`/`AuthService::set_handle`.
+    pub async fn set_channel_handle(
+        &self,
+        chat_id: i64,
+        acting_user_id: i64,
+        handle: Option<&str>,
+    ) -> Result<(), ChatError> {
+        if self.member_role(chat_id, acting_user_id).await?.as_deref() != Some("owner") {
+            return Err(ChatError::NotOwner);
+        }
+        if let Some(handle) = handle
+            && !is_valid_handle(handle)
+        {
+            return Err(ChatError::InvalidHandle);
+        }
+        sqlx::query("update chats set handle = $1 where id = $2")
+            .bind(handle)
+            .bind(chat_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| {
+                if is_unique_violation(&err) {
+                    ChatError::HandleTaken
+                } else {
+                    ChatError::Database(err)
+                }
+            })?;
+        Ok(())
+    }
+
+    /// This caller's own role in a chat ("owner" | "admin" | "member"), or
+    /// `None` if they're not an active member. Used both for permission
+    /// checks (promote/demote, channel send-gate) and to populate
+    /// `ChatSummary::my_role`.
+    pub async fn member_role(&self, chat_id: i64, user_id: i64) -> Result<Option<String>, ChatError> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "select role from chat_members where chat_id = $1 and user_id = $2 and left_at_ms is null",
+        )
+        .bind(chat_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(role,)| role))
+    }
+
+    /// `chat_members.kind` isn't a thing — this is `chats.kind` for a single
+    /// chat, used by the channel send-permission gate (`ws::handle_send_message`)
+    /// alongside `member_role` to decide "is this a channel, and can this
+    /// member post in it."
+    pub async fn chat_kind(&self, chat_id: i64) -> Result<Option<String>, ChatError> {
+        let row: Option<(String,)> = sqlx::query_as("select kind from chats where id = $1")
+            .bind(chat_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|(kind,)| kind))
+    }
+
+    /// Owner-only — promotes an existing member to `'admin'` (can post in a
+    /// channel, same send permission as the owner). 404-equivalent `Ok(false)`
+    /// if `target_user_id` isn't an active member.
+    pub async fn promote_member(&self, chat_id: i64, acting_user_id: i64, target_user_id: i64) -> Result<bool, ChatError> {
+        self.set_member_role(chat_id, acting_user_id, target_user_id, "admin").await
+    }
+
+    /// Owner-only — demotes an admin back to a plain `'member'`.
+    pub async fn demote_member(&self, chat_id: i64, acting_user_id: i64, target_user_id: i64) -> Result<bool, ChatError> {
+        self.set_member_role(chat_id, acting_user_id, target_user_id, "member").await
+    }
+
+    async fn set_member_role(
+        &self,
+        chat_id: i64,
+        acting_user_id: i64,
+        target_user_id: i64,
+        role: &str,
+    ) -> Result<bool, ChatError> {
+        if self.member_role(chat_id, acting_user_id).await?.as_deref() != Some("owner") {
+            return Err(ChatError::NotOwner);
+        }
+        let row: Option<(i64,)> = sqlx::query_as(
+            "update chat_members set role = $1
+             where chat_id = $2 and user_id = $3 and left_at_ms is null and role <> 'owner'
+             returning chat_id",
+        )
+        .bind(role)
+        .bind(chat_id)
+        .bind(target_user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
+    /// Public lookup for a channel by its `@handle` — no membership
+    /// required, only ever matches `kind = 'channel'` rows with a non-null
+    /// `handle` (a channel without one set is invite-only and simply isn't
+    /// found this way).
+    pub async fn find_channel_by_handle(&self, handle: &str) -> Result<Option<ChannelPreview>, ChatError> {
+        let row: Option<(i64, String, Option<String>, Option<i64>, i64, String)> = sqlx::query_as(
+            "select c.id, c.title, c.description, c.avatar_media_id,
+                    (select count(*) from chat_members gm where gm.chat_id = c.id and gm.left_at_ms is null) as member_count,
+                    c.handle
+             from chats c
+             where c.kind = 'channel' and c.handle = $1",
+        )
+        .bind(handle)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(chat_id, title, description, avatar_media_id, member_count, handle)| ChannelPreview {
+            chat_id,
+            title,
+            description,
+            avatar_media_id,
+            member_count,
+            handle,
+        }))
+    }
+
+    /// Subscribes `user_id` to a *public* channel (must have a non-null
+    /// `handle`) as a plain `'member'`. Idempotent — already being a member
+    /// is a no-op success, not an error, same spirit as
+    /// `get_or_create_direct_chat`'s reuse-over-duplicate behavior. Returns
+    /// `Ok(false)` if `chat_id` isn't a public channel at all.
+    pub async fn join_channel(&self, chat_id: i64, user_id: i64) -> Result<bool, ChatError> {
+        let is_public_channel: Option<(i32,)> =
+            sqlx::query_as("select 1 from chats where id = $1 and kind = 'channel' and handle is not null")
+                .bind(chat_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        if is_public_channel.is_none() {
+            return Ok(false);
+        }
+        sqlx::query(
+            "insert into chat_members (chat_id, user_id, role) values ($1, $2, 'member')
+             on conflict (chat_id, user_id) do update set left_at_ms = null",
+        )
+        .bind(chat_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(true)
+    }
+
+    /// `(user_id, username, role)` for every active member of a group or
+    /// channel — used by the group-info/channel-info panel. Not
+    /// membership-checked itself; callers must `is_member`-gate this the
+    /// same way every other chat-scoped read already is.
+    pub async fn group_members(&self, chat_id: i64) -> Result<Vec<(i64, String, String)>, ChatError> {
+        let rows: Vec<(i64, String, String)> = sqlx::query_as(
+            "select u.id, u.username, cm.role
+             from chat_members cm
+             join users u on u.id = cm.user_id
+             where cm.chat_id = $1 and cm.left_at_ms is null
+             order by (cm.role = 'owner') desc, u.username",
+        )
+        .bind(chat_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     // Only matches chats where *both* sides are still active members —
     // once either has left (see leave_chat), messaging the same person
     // again starts a fresh chat rather than resurrecting the old one.
@@ -194,32 +497,53 @@ impl ChatService {
         Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
-    /// Every direct chat the user belongs to, newest-activity first, with
-    /// the other participant's identity and last message preview — exactly
-    /// what a chat-list sidebar needs in one round trip.
-    pub async fn list_direct_chats_for_user(&self, user_id: i64) -> Result<Vec<DirectChatSummary>, ChatError> {
-        type Row = (
-            i64,
-            i64,
-            String,
-            Option<String>,
-            Option<i64>,
-            Option<String>,
-            Option<i64>,
-            bool,
-            bool,
-        );
+    /// Every chat (direct, self, group, or channel) the user belongs to,
+    /// newest-activity first, with the other participant's identity (or
+    /// group/channel metadata) and last message preview — exactly what a
+    /// chat-list sidebar needs in one round trip.
+    pub async fn list_chats_for_user(&self, user_id: i64) -> Result<Vec<ChatSummary>, ChatError> {
+        // A dedicated FromRow struct rather than a raw tuple — sqlx's tuple
+        // FromRow impls only go up to a bounded arity, and this query is
+        // already past the comfortable range of that once handle/my_role
+        // were added; a named struct has no such limit and reads better at
+        // this width besides.
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            chat_id: i64,
+            other_user_id: Option<i64>,
+            other_username: Option<String>,
+            body: Option<String>,
+            created_at_ms: Option<i64>,
+            media_kind: Option<String>,
+            deleted_at_ms: Option<i64>,
+            is_self: bool,
+            is_archived: bool,
+            is_group: bool,
+            is_channel: bool,
+            title: Option<String>,
+            description: Option<String>,
+            avatar_media_id: Option<i64>,
+            member_count: i64,
+            handle: Option<String>,
+            my_role: Option<String>,
+            unread_count: i64,
+        }
         // Unioned rather than one query with an outer-joined "other" member,
         // because a direct chat's "other" is a different row (other.user_id
-        // <> $1) while a self chat's "other" is the same row as "me" —
-        // genuinely two different shapes of query, not one query with an
-        // optional condition.
-        // Postgres doesn't allow an expression (only a bare column name) in
-        // a UNION's own ORDER BY, so the union is wrapped in a subquery and
-        // ordered from the outside instead, where it's just a plain SELECT.
+        // <> $1), a self chat's "other" is the same row as "me", and a
+        // group/channel chat has no single "other" at all — genuinely
+        // different shapes of query, not one query with an optional
+        // condition. Postgres doesn't allow an expression (only a bare
+        // column name) in a UNION's own ORDER BY, so the union is wrapped in
+        // a subquery and ordered from the outside instead, where it's just a
+        // plain SELECT.
         let rows: Vec<Row> = sqlx::query_as(
             "select * from (
-                select c.id, u.id, u.username, lm.body, lm.created_at_ms, lm.media_kind, lm.deleted_at_ms, false as is_self, me.archived_at_ms is not null as is_archived
+                select c.id, u.id, u.username, lm.body, lm.created_at_ms, lm.media_kind, lm.deleted_at_ms, false as is_self, me.archived_at_ms is not null as is_archived,
+                       false as is_group, false as is_channel, null::text as title, null::text as description, u.active_avatar_media_id as avatar_media_id, 2::bigint as member_count,
+                       null::text as handle, null::text as my_role,
+                       (select count(*) from messages um where um.chat_id = c.id and um.author_id <> $1 and um.deleted_at_ms is null
+                        and um.id > greatest(coalesce(me.last_read_message_id, 0), coalesce(me.cleared_before_id, 0))) as unread_count
                 from chats c
                 join chat_members me on me.chat_id = c.id and me.user_id = $1 and me.left_at_ms is null
                 join chat_members other on other.chat_id = c.id and other.user_id <> $1
@@ -233,7 +557,11 @@ impl ChatService {
 
                 union all
 
-                select c.id, u.id, u.username, lm.body, lm.created_at_ms, lm.media_kind, lm.deleted_at_ms, true as is_self, me.archived_at_ms is not null as is_archived
+                select c.id, u.id, u.username, lm.body, lm.created_at_ms, lm.media_kind, lm.deleted_at_ms, true as is_self, me.archived_at_ms is not null as is_archived,
+                       false as is_group, false as is_channel, null::text as title, null::text as description, u.active_avatar_media_id as avatar_media_id, 1::bigint as member_count,
+                       null::text as handle, null::text as my_role,
+                       (select count(*) from messages um where um.chat_id = c.id and um.author_id <> $1 and um.deleted_at_ms is null
+                        and um.id > greatest(coalesce(me.last_read_message_id, 0), coalesce(me.cleared_before_id, 0))) as unread_count
                 from chats c
                 join chat_members me on me.chat_id = c.id and me.user_id = $1 and me.left_at_ms is null
                 join users u on u.id = me.user_id
@@ -243,7 +571,24 @@ impl ChatService {
                     order by m.id desc limit 1
                 ) lm on true
                 where c.kind = 'self'
-             ) combined (chat_id, other_user_id, other_username, body, created_at_ms, media_kind, deleted_at_ms, is_self, is_archived)
+
+                union all
+
+                select c.id, null::bigint, null::text, lm.body, lm.created_at_ms, lm.media_kind, lm.deleted_at_ms, false as is_self, me.archived_at_ms is not null as is_archived,
+                       c.kind = 'group' as is_group, c.kind = 'channel' as is_channel, c.title, c.description, c.avatar_media_id,
+                       (select count(*) from chat_members gm where gm.chat_id = c.id and gm.left_at_ms is null) as member_count,
+                       c.handle, me.role as my_role,
+                       (select count(*) from messages um where um.chat_id = c.id and um.author_id <> $1 and um.deleted_at_ms is null
+                        and um.id > greatest(coalesce(me.last_read_message_id, 0), coalesce(me.cleared_before_id, 0))) as unread_count
+                from chats c
+                join chat_members me on me.chat_id = c.id and me.user_id = $1 and me.left_at_ms is null
+                left join lateral (
+                    select body, created_at_ms, media_kind, deleted_at_ms from messages m
+                    where m.chat_id = c.id and m.id > coalesce(me.cleared_before_id, 0)
+                    order by m.id desc limit 1
+                ) lm on true
+                where c.kind in ('group', 'channel')
+             ) combined (chat_id, other_user_id, other_username, body, created_at_ms, media_kind, deleted_at_ms, is_self, is_archived, is_group, is_channel, title, description, avatar_media_id, member_count, handle, my_role, unread_count)
              order by coalesce(created_at_ms, 0) desc",
         )
         .bind(user_id)
@@ -252,21 +597,28 @@ impl ChatService {
 
         Ok(rows
             .into_iter()
-            .map(
-                |(chat_id, other_user_id, other_username, text, created_at_ms, media_kind, deleted_at_ms, is_self, is_archived)| DirectChatSummary {
-                    chat_id,
-                    other_user_id,
-                    other_username,
-                    last_message: created_at_ms.map(|created_at_ms| LastMessage {
-                        text: text.unwrap_or_default(),
-                        created_at_ms,
-                        media_kind,
-                        deleted: deleted_at_ms.is_some(),
-                    }),
-                    is_self,
-                    is_archived,
-                },
-            )
+            .map(|row| ChatSummary {
+                chat_id: row.chat_id,
+                other_user_id: row.other_user_id,
+                other_username: row.other_username,
+                last_message: row.created_at_ms.map(|created_at_ms| LastMessage {
+                    text: row.body.unwrap_or_default(),
+                    created_at_ms,
+                    media_kind: row.media_kind,
+                    deleted: row.deleted_at_ms.is_some(),
+                }),
+                is_self: row.is_self,
+                is_archived: row.is_archived,
+                is_group: row.is_group,
+                is_channel: row.is_channel,
+                title: row.title,
+                description: row.description,
+                avatar_media_id: row.avatar_media_id,
+                member_count: row.member_count,
+                handle: row.handle,
+                my_role: row.my_role,
+                unread_count: row.unread_count,
+            })
             .collect())
     }
 
@@ -333,6 +685,7 @@ impl ChatService {
         media: Option<MediaRef>,
         reply_to_id: Option<i64>,
         forwarded_from: Option<ForwardedFromRef>,
+        kind: &str,
     ) -> Result<Message, ChatError> {
         let id = self.ids.next_id();
         let created_at_ms = now_ms();
@@ -340,8 +693,8 @@ impl ChatService {
             "insert into messages
                 (id, chat_id, author_id, body, created_at_ms,
                  media_id, media_kind, media_mime, media_name, media_size, media_duration_ms,
-                 reply_to_id, forwarded_from_user_id, forwarded_from_username)
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+                 reply_to_id, forwarded_from_user_id, forwarded_from_username, kind)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
         )
         .bind(id)
         .bind(chat_id)
@@ -357,6 +710,7 @@ impl ChatService {
         .bind(reply_to_id)
         .bind(forwarded_from.as_ref().map(|f| f.user_id))
         .bind(forwarded_from.as_ref().map(|f| &f.username))
+        .bind(kind)
         .execute(&self.pool)
         .await?;
 
@@ -377,7 +731,18 @@ impl ChatService {
             forwarded_from,
             edited_at_ms: None,
             deleted_at_ms: None,
+            kind: kind.to_string(),
         })
+    }
+
+    /// A server-generated notice ("Alice created the group", "Alice added
+    /// Bob and Carol") — persisted and broadcast exactly like an ordinary
+    /// message, just with `kind = "system"` so clients render it as a
+    /// centered pill instead of a normal bubble. `actor_id` is whoever
+    /// performed the action (always a real member, never a synthetic
+    /// system user) so existing author-keyed rendering keeps working.
+    pub async fn insert_system_message(&self, chat_id: i64, actor_id: i64, body: String) -> Result<Message, ChatError> {
+        self.insert_message(chat_id, actor_id, body, None, None, None, "system").await
     }
 
     /// Partitioned conceptually by `(chat_id, id)` — `id` is a time-sortable
@@ -405,7 +770,7 @@ impl ChatService {
         const COLUMNS: &str = "m.id, m.chat_id, m.author_id, m.body, m.created_at_ms,
              m.media_id, m.media_kind, m.media_mime, m.media_name, m.media_size, m.media_duration_ms,
              m.reply_to_id, m.forwarded_from_user_id, m.forwarded_from_username,
-             m.edited_at_ms, m.deleted_at_ms,
+             m.edited_at_ms, m.deleted_at_ms, m.kind,
              r.author_id as reply_author_id, r.body as reply_text, r.media_kind as reply_media_kind,
              r.deleted_at_ms as reply_deleted_at_ms";
         const FROM: &str = "from messages m
@@ -449,6 +814,29 @@ impl ChatService {
         sqlx::query(
             "update chat_members
              set cleared_before_id = coalesce((select max(id) from messages where chat_id = $1), 0)
+             where chat_id = $1 and user_id = $2",
+        )
+        .bind(chat_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Marks everything currently in the chat as read for this caller —
+    /// sets `last_read_message_id` to the chat's current latest message id
+    /// (never moves it backward, in case of a race with a message that
+    /// arrived between the caller loading the chat and this call landing).
+    /// Mirrors `clear_chat`'s exact shape, just for "I've seen this"
+    /// (affects `unread_count` in `list_chats_for_user`) instead of "hide
+    /// this from my view".
+    pub async fn mark_chat_read(&self, chat_id: i64, user_id: i64) -> Result<(), ChatError> {
+        sqlx::query(
+            "update chat_members
+             set last_read_message_id = greatest(
+                 coalesce(last_read_message_id, 0),
+                 coalesce((select max(id) from messages where chat_id = $1), 0)
+             )
              where chat_id = $1 and user_id = $2",
         )
         .bind(chat_id)
@@ -685,6 +1073,7 @@ struct MessageRow {
     forwarded_from_username: Option<String>,
     edited_at_ms: Option<i64>,
     deleted_at_ms: Option<i64>,
+    kind: String,
     reply_author_id: Option<i64>,
     reply_text: Option<String>,
     reply_media_kind: Option<String>,
@@ -723,9 +1112,32 @@ fn row_to_message(row: MessageRow) -> Message {
         forwarded_from,
         edited_at_ms: row.edited_at_ms,
         deleted_at_ms: row.deleted_at_ms,
+        kind: row.kind,
     }
 }
 
 fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+}
+
+// Same rule as `chat_auth`'s identical (private, unexported) validator for
+// `users.handle` — kept in sync by hand rather than sharing a crate, since
+// it's a 7-line rule and a cross-crate dependency just for this would be
+// more ceremony than the duplication it avoids. 3-32 chars, lowercase ascii
+// letters/digits/underscore, must start with a letter.
+fn is_valid_handle(handle: &str) -> bool {
+    let mut chars = handle.chars();
+    let Some(first) = chars.next() else { return false };
+    if !first.is_ascii_lowercase() {
+        return false;
+    }
+    (3..=32).contains(&handle.len())
+        && handle.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+fn is_unique_violation(err: &sqlx::Error) -> bool {
+    matches!(
+        err.as_database_error().and_then(|db_err| db_err.code()),
+        Some(code) if code == "23505"
+    )
 }

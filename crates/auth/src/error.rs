@@ -2,6 +2,12 @@
 pub enum AuthError {
     #[error("username already taken")]
     UsernameTaken,
+    #[error("handle already taken")]
+    HandleTaken,
+    #[error("invalid handle")]
+    InvalidHandle,
+    #[error("bio must be 500 characters or fewer")]
+    BioTooLong,
     #[error("invalid username or password")]
     InvalidCredentials,
     #[error("invalid or expired token")]

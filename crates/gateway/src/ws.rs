@@ -279,11 +279,31 @@ async fn subscribe_to_chat(state: &Arc<AppState>, chat_id: i64, tx: mpsc::Sender
 async fn handle_send_message(state: &AppState, user_id: i64, send_message: SendMessage) -> Result<(), Envelope> {
     let chat_id = send_message.chat_id as i64;
 
-    match state.chat.is_member(chat_id, user_id).await {
-        Ok(true) => {}
-        Ok(false) => return Err(error_envelope(403, "not a member of this chat")),
+    // `member_role` doubles as the membership check here (non-member ->
+    // `None`) — every other chat kind has a role column default of
+    // 'member' too, so this replaces a separate `is_member` call rather
+    // than adding one on top of it.
+    let my_role = match state.chat.member_role(chat_id, user_id).await {
+        Ok(Some(role)) => role,
+        Ok(None) => return Err(error_envelope(403, "not a member of this chat")),
         Err(err) => {
             tracing::error!(?err, "membership check failed");
+            return Err(error_envelope(500, "database error"));
+        }
+    };
+
+    // A channel is a broadcast surface — only its owner/admins may post;
+    // everyone else is a read-only subscriber. Every other chat kind (direct,
+    // self, group) has no such restriction, same as before this check existed.
+    match state.chat.chat_kind(chat_id).await {
+        Ok(Some(kind)) if kind == "channel" => {
+            if !matches!(my_role.as_str(), "owner" | "admin") {
+                return Err(error_envelope(403, "only channel admins can post here"));
+            }
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::error!(?err, "chat kind check failed");
             return Err(error_envelope(500, "database error"));
         }
     }
@@ -306,7 +326,7 @@ async fn handle_send_message(state: &AppState, user_id: i64, send_message: SendM
 
     let message = state
         .chat
-        .insert_message(chat_id, user_id, send_message.text, incoming_media, reply_to_id, forwarded_from)
+        .insert_message(chat_id, user_id, send_message.text, incoming_media, reply_to_id, forwarded_from, "text")
         .await
         .map_err(|err| {
             tracing::error!(?err, "failed to persist message");
@@ -351,6 +371,7 @@ async fn handle_send_message(state: &AppState, user_id: i64, send_message: SendM
             reply_to_id: message.reply_to_id.unwrap_or(0) as u64,
             reply_preview,
             forwarded_from,
+            kind: message.kind,
         })),
     };
 
@@ -487,7 +508,7 @@ async fn relay_to_chat(state: &AppState, user_id: i64, chat_id: i64, envelope: E
     })
 }
 
-async fn publish_to_chat(state: &AppState, chat_id: i64, envelope: &Envelope) -> Result<(), async_nats::PublishError> {
+pub(crate) async fn publish_to_chat(state: &AppState, chat_id: i64, envelope: &Envelope) -> Result<(), async_nats::PublishError> {
     state.nats.publish(format!("chat.{chat_id}"), encode(envelope).into()).await
 }
 
@@ -513,7 +534,7 @@ fn error_envelope(code: u32, message: &str) -> Envelope {
     }
 }
 
-fn encode(envelope: &Envelope) -> Vec<u8> {
+pub(crate) fn encode(envelope: &Envelope) -> Vec<u8> {
     let mut buf = Vec::with_capacity(envelope.encoded_len());
     envelope
         .encode(&mut buf)

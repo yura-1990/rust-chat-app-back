@@ -98,6 +98,41 @@ pub struct MediaStore {
     secret: String,
 }
 
+/// Longest edge a group avatar is resized to before re-encoding. Avatars
+/// are shown small (list rows, headers, info panels) — there's no reason
+/// to keep more resolution than that around.
+pub const AVATAR_MAX_EDGE: u32 = 512;
+/// Raw upload size cap for an avatar, *before* optimization — generous
+/// enough for an un-cropped phone photo, far smaller than the 25 MB general
+/// attachment cap since this is a single small image, not a video/file.
+pub const AVATAR_MAX_UPLOAD_BYTES: usize = 8 * 1024 * 1024;
+const AVATAR_WEBP_QUALITY: f32 = 90.0;
+
+#[derive(Debug)]
+pub struct AvatarError;
+
+impl std::fmt::Display for AvatarError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "could not decode that as an image")
+    }
+}
+
+/// Validates the upload is actually a decodable image (never trust the
+/// client's declared Content-Type/extension — same principle as the `file`
+/// kind's extension check above), resizes it to at most `AVATAR_MAX_EDGE`
+/// on the longest side, and re-encodes it as lossy WebP — a small file at
+/// visually-unchanged quality, regardless of what format/size came in.
+pub fn optimize_avatar(bytes: &[u8]) -> Result<Vec<u8>, AvatarError> {
+    let img = image::load_from_memory(bytes).map_err(|_| AvatarError)?;
+    let img = if img.width() > AVATAR_MAX_EDGE || img.height() > AVATAR_MAX_EDGE {
+        img.resize(AVATAR_MAX_EDGE, AVATAR_MAX_EDGE, image::imageops::FilterType::Lanczos3)
+    } else {
+        img
+    };
+    let encoder = webp::Encoder::from_image(&img).map_err(|_| AvatarError)?;
+    Ok(encoder.encode(AVATAR_WEBP_QUALITY).to_vec())
+}
+
 impl MediaStore {
     pub fn new(base_dir: PathBuf, secret: String) -> Self {
         Self { base_dir, secret }
@@ -105,6 +140,30 @@ impl MediaStore {
 
     fn path_for(&self, chat_id: i64, media_id: i64, ext: &str) -> PathBuf {
         self.base_dir.join(chat_id.to_string()).join(format!("{media_id}.{ext}"))
+    }
+
+    /// Avatars aren't scoped to one chat_id (a group's avatar is set at
+    /// creation time, independent of any one message), so they live in
+    /// their own namespace directory instead of under a per-chat one.
+    fn avatar_path_for(&self, media_id: i64) -> PathBuf {
+        self.base_dir.join("avatars").join(format!("{media_id}.webp"))
+    }
+
+    pub async fn store_avatar(&self, media_id: i64, bytes: &[u8]) -> std::io::Result<()> {
+        let dir = self.base_dir.join("avatars");
+        tokio::fs::create_dir_all(&dir).await?;
+        tokio::fs::write(self.avatar_path_for(media_id), bytes).await
+    }
+
+    pub async fn load_avatar(&self, media_id: i64) -> std::io::Result<Vec<u8>> {
+        tokio::fs::read(self.avatar_path_for(media_id)).await
+    }
+
+    /// Avatars are served unsigned, unlike chat media — low-sensitivity,
+    /// meant to be visible to anyone who can see the group exists, the same
+    /// way a Telegram group avatar isn't access-controlled per viewer.
+    pub fn avatar_url(&self, media_id: i64) -> String {
+        format!("/avatars/{media_id}")
     }
 
     async fn store(&self, chat_id: i64, media_id: i64, ext: &str, bytes: &[u8]) -> std::io::Result<()> {
@@ -149,6 +208,15 @@ impl MediaStore {
         let Some(ext) = extension_for(kind, mime) else { return };
         if let Err(err) = tokio::fs::remove_file(self.path_for(chat_id, media_id, ext)).await {
             tracing::warn!(?err, chat_id, media_id, "failed to remove deleted media file");
+        }
+    }
+
+    /// Best-effort removal of an avatar file (group or personal-gallery)
+    /// once its DB row is deleted — same disk-hygiene-only contract as
+    /// `delete` above.
+    pub async fn delete_avatar(&self, media_id: i64) {
+        if let Err(err) = tokio::fs::remove_file(self.avatar_path_for(media_id)).await {
+            tracing::warn!(?err, media_id, "failed to remove deleted avatar file");
         }
     }
 
